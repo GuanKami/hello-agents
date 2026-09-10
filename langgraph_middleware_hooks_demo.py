@@ -1,22 +1,30 @@
 """
 实验名称：before_model / after_model 写入 Agent State
-实验目标：观察 `create_agent` 内部 ReAct 循环中，`@before_model` 与 `@after_model`
-    两个 hook 的真实触发时机，并验证"hook 返回的 dict 会被当作 State 更新合并进
-    Agent State"这一语义与普通图节点完全一致。
-解决的问题：之前的 `@dynamic_prompt` 实验只能影响"模型这一次看到什么提示词"，改动
-    不落盘、State 里查不到。本实验要回答：Middleware 能不能真正修改工作流状态？
-    如果能，改动能活多久、能在哪里被读到？
+实验目标：
+    1. 观察 @before_model 与 @after_model 在 create_agent 内部 ReAct 循环中的
+       真实触发时机，证明"hook 触发次数 == 模型调用次数"。
+    2. 验证"hook 返回的 dict 会被当作 State 更新合并进 Agent State"这一语义，
+       与普通图节点的返回值语义完全一致。
+
+解决的问题：
+    上一个实验 @dynamic_prompt 只能影响"模型这一次看到什么提示词"，
+    改动不落盘、State 里查不到、下一次调用就没了。
+    本实验要回答一个更根本的问题：
+        Middleware 能不能真正修改工作流状态？改动能活多久？在哪里能被读到？
+
 使用的 Agent 概念：
     - Middleware hook（before_model / after_model）
-    - `create_agent` 内部隐式构建的 ReAct 循环（model -> after_model -> tools -> before_model）
-    - State schema 合并（middleware 声明的 state_schema 会并入整图 State）
-    - LangChain 的 `AgentState` 与 LangGraph 的 `MessagesState` 的区别
+    - create_agent 内部隐式构建的 ReAct 循环
+    - State schema 声明与合并（middleware 声明的 state_schema 会并入整图 State）
+    - LangChain 的 AgentState（来自 langchain.agents.middleware）与
+      LangGraph 的 MessagesState（来自 langgraph.graph）的区别
+
 系统架构（本实验刻意保持最小，只观察 hook，不做别的）：
 
     START
-      -> log_before_model.before_model      <- 自己写的 hook，循环入口，每轮都跑
-      -> model                             <- create_agent 内部的模型节点
-      -> log_after_model.after_model        <- 自己写的 hook，每轮出口
+      -> count_model_calls.before_model      <- 自己写的 hook，循环入口，每轮都跑
+      -> model                               <- create_agent 内部的模型节点
+      -> inspect_model_output.after_model    <- 自己写的 hook，每轮出口
       -> 条件路由 ─┬─ 有 tool_calls -> tools -> 回到 before_model
                    └─ 无 tool_calls -> END
 
@@ -25,122 +33,103 @@
         last_tool_names  : after_model 记录本轮模型请求了哪些工具
 
 实现方式：
-    1. 定义 `MiddlewareState`，继承框架自带的 `AgentState`，新增上面两个字段。
-    2. 用 `@before_model` / `@after_model` 装饰两个函数，各自返回 dict 作为 State patch。
-    3. 通过 `create_agent(..., state_schema=MiddlewareState)` 把扩展字段并进整图 State。
-    4. `main()` 发两种请求做对照：一种必然触发工具（问天气），一种不触发（寒暄）。
+    1. 定义 CallCountState，继承框架自带的 AgentState，新增上面两个字段。
+    2. 用 @before_model / @after_model 装饰两个函数，各自返回 dict 作为 State patch。
+    3. 通过 create_agent(..., state_schema=CallCountState) 把扩展字段并进整图 State。
+    4. main() 发两种请求做对照：一种会触发工具（问天气），一种不触发（寒暄）。
 
-验证方式（两条路径，建议先跑零成本的那条）：
-    路径 A（零 API 成本，确定性）：运行 `run_deterministic_selfcheck()`。
-        它用假模型驱动一个完整的工具调用循环，期望看到：
-            before_model 第 1 次，消息数 1
-            after_model  看到 tool_calls = ['get_weather']
-            before_model 第 2 次，消息数 3      <- 多了 AIMessage + ToolMessage
-            after_model  看到 tool_calls = []
-            最终 model_call_count == 2
-        这是确定性验证，不依赖真实模型是否愿意调用工具。
-    路径 B（真实模型，有 API 成本，属手动验证）：运行 `main()`。
-        期望同样看到 hook 各触发 2 次（问天气）与 1 次（寒暄）。
-        注意：免费/小模型不保证稳定调用工具，若它直接口头回答天气，会只触发 1 次，
-        这是"模型不配合"而非 hook 配置错误。
+验证方式（手动实验，会产生真实 LLM API 调用与费用）：
+    运行 main()，肉眼核对以下三点，全部符合即为通过：
+
+    请求 A（"你好"，寒暄，不触发工具）：
+        [before_model] 第 1 次 ... 当前 State 消息数 = 1
+        [after_model]  模型产出 tool_calls = []
+        之后没有第二次 —— 因为模型直接回答了，循环结束。
+
+    请求 B（"北京今天天气怎么样？"，触发工具）：
+        [before_model] 第 1 次 ... 当前 State 消息数 = 1
+        [after_model]  模型产出 tool_calls = ['get_weather']
+        [before_model] 第 2 次 ... 当前 State 消息数 = 3   <- 多了 2 条
+        [after_model]  模型产出 tool_calls = []
+        最后看"最终 State 摘要"，model_call_count 应为 2。
+
+    为什么第 2 次是 3 而不是 2：
+        1 条 HumanMessage
+      + 1 条"模型决定调用工具"的 AIMessage（带 tool_calls）
+      + 1 条"工具执行结果"的 ToolMessage
+      = 3 条。
+        这 2 条新增消息正是 ReAct 一轮完整的"行动 + 观察"。它们必须被 append 进
+        state["messages"]，因为 LLM 是无状态的：第 2 次调用时如果不把完整历史
+        重新发过去，模型就不知道"自己上一轮已经查过天气、结果已经拿到"，
+        于是会再查一次 -> 又一轮 -> 无限循环。
+        注意这 3 条**不包含**模型第 2 次产出的最终回答，因为本 hook 是在
+        "即将调用模型之前"读取 State，那条回答此时还没被生成。
 
 学习总结（已实测确认，不是推测）：
-    - `before_model` / `after_model` 会被编译成**真正的图节点**，节点名形如
-      `{middleware名字}.before_model`。可以用 draw_mermaid() 看到它们。
-    - 它们位于 ReAct 循环内部：`tools -> before_model -> model -> after_model`
-      构成一轮迭代，所以"模型调用几次，两个 hook 就各触发几次"。
-    - 它们返回的 dict 会被当成 State 更新合并进状态，且**在 invoke 返回后依然可读**。
-      这一点是它们与 `@dynamic_prompt` 的本质区别——后者由 wrap_model_call 实现，
-      只改这一次请求的 system message，不会写进 State。
+    1. before_model / after_model 会被编译成**真正的图节点**，节点名形如
+       {middleware名字}.before_model。用 agent.get_graph().draw_mermaid() 可以看到。
+    2. 它们位于 ReAct 循环内部：tools -> before_model -> model -> after_model
+       构成一轮迭代。所以"模型调用几次，两个 hook 就各触发几次"。
+    3. 它们返回的 dict 会被当成 State 更新合并进状态，且**在 invoke 返回后依然可读**。
+       这一点是它们与 @dynamic_prompt 的本质区别 —— 后者由 wrap_model_call 实现，
+       只改这一次请求的 system message，不会写进 State。
 
 已知限制：
-    - Store 用的是 `InMemoryStore`，资料只在当前 Python 进程内有效，退出即丢失。
-      （跨进程持久化应换 `SqliteStore`，见 AGENTS.md 12.2 节。）
-    - 字段只在单次 `invoke` 内有效：没有接 checkpointer，每次 invoke 都是全新的
-      State，所以计数会从 1 重新开始。这是刻意设计，不是缺陷。
+    - Store 用的是 InMemoryStore，资料只在当前 Python 进程内有效，退出即丢失。
+      （跨进程持久化应换 SqliteStore，见 AGENTS.md 12.2 节。）
+    - 字段只在单次 invoke 内有效：没有接 checkpointer，每次 invoke 都是全新的
+      State，所以 main() 里第二次请求的计数会从 1 重新开始，而不是接着上一次。
+      这是刻意设计，不是缺陷。
     - 只注册了一个 before_model 和一个 after_model，没有验证多个 middleware 的
       组合顺序（多个 after_model 是**逆序**串联的，因为它是栈式包裹）。
-    - 没有验证 `can_jump_to` 跳转、消息裁剪、模型切换等更高级的 hook 用法。
+    - 没有验证 can_jump_to 跳转、消息裁剪、模型切换等更高级的 hook 用法。
+    - 真实模型路径依赖模型"愿意调用工具"。免费/小模型可能直接凭记忆回答天气，
+      那样只会触发 1 次。这属于"模型不配合"，不是 hook 配置错误。
+    - 本实验刻意只用真实模型验证，不引入假模型/Mock：每次验证都会产生真实
+      API 调用与费用，且结果受模型当时行为影响，不可完全复现。
+      这是有意选择（保持实验贴近真实运行），代价是验证不是确定性的。
 
 后续优化方向：
     - 把 Store 换成 SqliteStore，验证跨进程长期资料是否仍能被 hook 读到。
     - 增加第二个 before_model，观察多个同类型 hook 的执行顺序。
-    - 尝试 `@before_model(can_jump_to=["end"])` + 返回 Command，为 Human-in-the-loop
-      的 interrupt / 审批做铺垫。
+    - 尝试 @before_model(can_jump_to=["end"]) + 返回 Command，
+      为 Human-in-the-loop 的 interrupt / 审批做铺垫。
 """
-
 import os
 
+from typing import NotRequired
 from dotenv import load_dotenv
+
 from langchain.agents import create_agent
-from langchain.agents.middleware import AgentState, after_model, before_model
-from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage
+from langchain.agents.middleware import before_model, after_model, AgentState
 from langchain_openai import ChatOpenAI
 from langgraph.store.memory import InMemoryStore
+from langgraph.runtime import Runtime
 
-from tools import Context, get_weather
+from tools import Context, get_weather, get_user_info, save_user_info
 
-# 注意：必须在创建任何 ChatOpenAI 之前加载 .env。
-# 这些模型对象在构造时就会去读 LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL，
-# 如果 load_dotenv() 晚于构造，模型会拿到 None 配置。
-# 旧版本草稿把 load_dotenv() 放在 main() 里，且把模型建在模块顶层，
-# 依赖 tools 模块的导入副作用才侥幸可用——那是脆弱的隐式依赖，已修正。
+# ============================================================================
+# 一、模型与 .env 的加载顺序（这里有个容易踩的坑）
+# ============================================================================
+#
+# 必须先 load_dotenv()，再构造 ChatOpenAI。
+#
+# 为什么：ChatOpenAI 在**构造时**就会读取 LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL
+# 这三个值。如果 load_dotenv() 晚于构造，os.getenv() 会返回 None，
+# 模型就带着空配置被创建出来。
+#
+# 旧版本把 load_dotenv() 写在 main() 里、却把 ChatOpenAI 建在模块顶层，
+# 它之所以"看起来能跑"，是因为下面这行 `from tools import ...` 先执行了，
+# 而 tools.py 顶部自带 load_dotenv()，等于替本模块把 .env 加载进了 os.environ。
+# 那是**隐式副作用**，不是本模块的正确性保证：一旦调整 import 顺序就会静默失效。
+# 现在把 load_dotenv() 显式提到 import 之后、构造模型之前，去掉这个隐患。
 load_dotenv()
 
-
-# ============================================================================
-# 一、State：先搞清楚这个类从哪来、为什么要继承它
-# ============================================================================
-#
-# 初学者最容易卡住的点：`AgentState` 我没有定义过，为什么可以直接继承？
-#
-# 答：`AgentState` 是 **LangChain 框架自带的类型**，不是本项目的类。
-#     它从 `langchain.agents.middleware` 导入，定义位置在
-#     `langchain/agents/middleware/types.py`，本身是一个 TypedDict：
-#
-#         class AgentState(TypedDict, Generic[ResponseT]):
-#             messages: Required[...]              # 对话消息列表
-#             jump_to: Optional[Literal[...]]      # 条件跳转目标
-#             structured_response: ResponseT       # 结构化输出
-#
-#     你要做的只是"在它基础上扩展字段"，父类字段自动继承。
-#
-# 第二个容易混淆的点：为什么这里用 `AgentState`，而
-# `langgraph_state_context_demo.py` 里用的是 `MessagesState`？
-#
-#     它们是**两个框架层各自定义的两个类，彼此之间没有继承关系**：
-#
-#         MessagesState  (来自 langgraph.graph)       只自带 messages
-#         AgentState     (来自 langchain.agents...)   messages + jump_to + structured_response
-#
-#     `create_agent` 内部依赖 `jump_to` 实现 can_jump_to 跳转、依赖
-#     `structured_response` 承载结构化输出，所以用 create_agent 时必须基于
-#     `AgentState`。而你手写 StateGraph 时才用 `MessagesState`。
-#
-#     一句话：自己搭图时你定义 State；用高层 API 时框架定义 State，你只做扩展。
-#
-class MiddlewareState(AgentState):
-    """
-    Agent 工作流状态，在框架自带的 AgentState 上追加本实验需要的字段。
-
-    字段首次注册时**还不存在**，所以代码里一律用 `state.get("字段", 默认值)` 读取，
-    不能直接下标访问。原因：AgentState 继承了 TypedDict 的默认行为（total=True），
-    这两个注解会被视作"必填"；而图在第一次进入 before_model 时 State 里
-    确实还没有 model_call_count。用 `.get()` 提供默认值既安全，
-    也准确表达了"这是运行时逐步填充的字段"。
-
-    如果想让它更严谨，可以显式写 `model_call_count: NotRequired[int]`
-    （需 from typing import NotRequired）。本实验保持注解最简，
-    把"可缺省"这层语义交给 `.get()` 的默认值来表达。
-    """
-
-    # before_model 每轮 +1。用它来证明"hook 触发次数 == 模型调用次数"。
-    model_call_count: int
-
-    # after_model 记录本轮模型请求调用了哪些工具，用于观察模型行为。
-    last_tool_names: list[str]
-
+llm = ChatOpenAI(
+    model=os.getenv("LLM_MODEL_ID"),
+    api_key=os.getenv("LLM_API_KEY"),
+    base_url=os.getenv("LLM_BASE_URL"),
+)
 
 # ============================================================================
 # 二、长期记忆 Store
@@ -149,24 +138,41 @@ def build_store() -> InMemoryStore:
     """
     创建本次程序运行期间共享的长期记忆 Store。
 
-    为什么要把 Store 做成函数返回值，而不是模块级全局单例？
+    为什么把 Store 做成函数返回值，而不是模块级全局单例？
         因为 Store 是**运行时资源**，应该由"运行入口"决定用哪一个后端
         （现在用 InMemoryStore，将来换 SqliteStore 只改这里）。
-        Node / hook 只通过 runtime.store 访问它，不关心它存在哪里——
-        这就是依赖注入的好处。
+        Node / hook 只通过 runtime.store 访问它，不关心它存在哪里 ——
+        这就是依赖注入，和后端里"Repository 接口不关心底层是 MySQL 还是 PG"同理。
 
     InMemoryStore 的生命周期限制：
         数据只活在当前 Python 进程内，进程一退出就全部丢失。
-        所以本实验的 user_2 资料在每次运行时都会被重新写入。
+        所以本实验的资料在每次运行时都会被重新写入。
+
+    注意：本实验的两个 hook 都没有用到 Store，这里保留它是为了与
+    @dynamic_prompt 实验保持同样的骨架，方便对照。
     """
     store = InMemoryStore()
+
+    # namespace ("users",) + key "user_1" 构成长期记忆的精确寻址路径。
+    # 用精确 key 而不是语义 search()，因为姓名/语言这类是结构化事实，
+    # 需要 100% 准确，不能接受向量检索的近似排序。
+    store.put(
+        ("users",),
+        "user_1",
+        {
+            "name": "派大星",
+            "language": "中文",
+            "favorite_topics": ["LangGraph", "LangChain"],
+            "identity": "从业者",
+        },
+    )
 
     store.put(
         ("users",),
         "user_2",
         {
             "name": "猪八戒",
-            "language": "中文",
+            "language": "English",
             "favorite_topics": ["美食"],
             "identity": "厨师",
         },
@@ -176,13 +182,77 @@ def build_store() -> InMemoryStore:
 
 
 # ============================================================================
-# 三、两个 hook：本实验的核心
+# 三、State：先搞清楚这个类从哪来、为什么要继承它
 # ============================================================================
 #
-# 先解释装饰器语法，因为 `@before_model(state_schema=...)` 这种"带参数的装饰器"
+# 初学者最容易卡住的点：AgentState 我没有定义过，为什么可以直接继承？
+#
+# 答：AgentState 是 **LangChain 框架自带的类型**，不是本项目的类。
+#     它从 langchain.agents.middleware 导入，定义在
+#     langchain/agents/middleware/types.py，本身是一个 TypedDict：
+#
+#         class AgentState(TypedDict, Generic[ResponseT]):
+#             messages: Required[...]           # 对话消息列表
+#             jump_to: Optional[Literal[...]]   # 条件跳转目标
+#             structured_response: ResponseT    # 结构化输出
+#
+#     你要做的只是"在它基础上扩展字段"，父类字段自动继承。
+#
+# 第二个容易混淆的点：为什么这里用 AgentState，而
+# langgraph_state_context_demo.py 里用的是 MessagesState？
+#
+#     它们是**两个框架层各自定义的两个类，彼此之间没有继承关系**：
+#
+#         MessagesState  (来自 langgraph.graph)        只自带 messages
+#         AgentState     (来自 langchain.agents...)    messages + jump_to + structured_response
+#
+#     create_agent 内部依赖 jump_to 实现 can_jump_to 跳转、依赖
+#     structured_response 承载结构化输出，所以用 create_agent 时必须基于
+#     AgentState。而你手写 StateGraph 时才用 MessagesState。
+#
+#     一句话：自己搭图时你定义 State；用高层 API 时框架定义 State，你只做扩展。
+#
+class CallCountState(AgentState):
+    """
+    Agent 工作流状态，在框架自带的 AgentState 上追加本实验需要的字段。
+
+    为什么用 NotRequired：
+        这些字段在第一次进入 before_model 时**还不存在**，
+        是运行时由 hook 逐步填充的。标成 NotRequired 既表达了
+        "可以缺省"，也提醒读取时要用 state.get("字段", 默认值)。
+
+    ⚠️ 这里必须解释一个静默陷阱（本实验最重要的坑）：
+        state_schema 只做**声明**，不做类型检查。
+        如果某个自定义字段没有出现在合并后的 State schema 里，
+        hook 返回的对应 patch 会被**静默丢弃，而且不报任何错**。
+
+        已实测：不声明 state_schema 时返回 {"model_call_count": 99}，
+        invoke 正常结束、不抛异常，但最终读到的是 None；声明后能正确读到 99。
+
+        所以当你发现"我的字段怎么不见了"，第一个要检查的就是：
+        这个字段有没有出现在整图合并后的 State schema 里。
+    """
+
+    # before_model 每轮 +1。用它来证明"hook 触发次数 == 模型调用次数"。
+    model_call_count: NotRequired[int]
+
+    # after_model 记录本轮模型请求调用了哪些工具，用于观察模型行为。
+    last_tool_names: NotRequired[list[str]]
+
+    # 证明确实写进了 State 的占位字段。
+    # 当前两个 hook 都没有写它，保留是为了让你可以亲手加一行
+    # return {"middleware_note": "..."} 验证写入行为。
+    middleware_note: NotRequired[str]
+
+
+# ============================================================================
+# 四、两个 hook：本实验的核心
+# ============================================================================
+#
+# 先解释装饰器语法，因为 @before_model(state_schema=...) 这种"带参数的装饰器"
 # 很容易被误读成一条声明语句。
 #
-# `before_model` 本身就是一个普通函数，签名是：
+# before_model 本身就是一个普通函数，签名是：
 #
 #     def before_model(func=None, *, state_schema=None, tools=None,
 #                      can_jump_to=None, name=None): ...
@@ -192,64 +262,61 @@ def build_store() -> InMemoryStore:
 #     写法 A（不带括号）：@before_model
 #         直接把被装饰的函数当作 func 参数传进去。
 #
-#     写法 B（带括号）：  @before_model(state_schema=MiddlewareState)
+#     写法 B（带括号）：  @before_model(state_schema=CallCountState)
 #         先传入关键字参数、拿到一个装饰器，再作用到函数上。
 #
 # 两种写法都会返回一个 AgentMiddleware 实例，区别只是写法 B 额外声明了
-# "我这个 hook 需要 State 里有 MiddlewareState 这些字段"。
+# "我这个 hook 需要 State 里有 CallCountState 这些字段"。
 #
+# 本文件采用**写法 B**，在两个装饰器上各自声明 state_schema，
+# 同时也在 create_agent(...) 里显式传了 state_schema=CallCountState（见 build_agent）。
+# 两处都写是冗余但安全的：create_agent 编译时会收集所有 middleware 声明的
+# state_schema 与 base_state 求并集（源码位置 langchain/agents/factory.py，
+# 形如 state_schemas = [*(m.state_schema for m in middleware), base_state]），
+# 两处声明同一个类不会冲突。
 #
-# 那么 state_schema 到底做什么？——它只做**声明**，不做类型检查。
+# 额外提醒：hook 生成的 middleware 类名默认取**函数名**。
+# 如果将来再加一个 before_model，且两个函数恰好同名，
+# create_agent 会抛 AssertionError: Please remove duplicate middleware instances.
+# 那种情况需要显式传 name="..." 区分。
 #
-# `create_agent` 在编译时会收集所有 middleware 声明的 state_schema，
-# 和基类 AgentState 求并集，得到整张图最终的 State 结构
-# （源码位置：langchain/agents/factory.py，形如
-#   state_schemas = [*(m.state_schema for m in middleware), base_state]
-#   resolved_state_schema, _, _ = _resolve_schemas(state_schemas) ）。
-#
-# 注意 base_state 排在列表最后，意味着冲突时 create_agent(state_schema=...)
-# 的声明优先。所以本实验把 state_schema 统一声明在 create_agent(...) 上
-# （见 build_agent），下面两个装饰器因此不带参数。
-#
-# ⚠️ 必须记住的坑：如果自定义字段没有出现在合并后的 State schema 里，
-#    你返回的 State patch 会被**静默丢弃，而且不报任何错**。
-#    已实测：不声明 state_schema 时返回 {"model_call_count": 99}，
-#    invoke 正常结束，但最终读到的是 None；声明后能正确读到 99。
-#    所以调试"我的字段怎么不见了"时，第一个要检查的就是这个声明。
-#
-@before_model
-def log_before_model(state: MiddlewareState, runtime) -> dict | None:
+@before_model(state_schema=CallCountState)
+def count_model_calls(state: CallCountState, runtime: Runtime) -> dict | None:
     """
     在每次调用模型**之前**执行。
 
-    生命周期位置：它是 ReAct 循环的**入口**。`tools` 节点执行完会回到这里，
+    生命周期位置：它是 ReAct 循环的**入口**。tools 节点执行完会回到这里，
     所以只要模型还在请求工具，这个函数就会被反复触发。
 
     返回的 dict 会被合并进 State。这里刻意不用模块级全局变量来计数：
         - 同一次 invoke 内，State 在循环的各节点间传递，所以计数会累加到 2；
         - 不同 invoke 之间没有 checkpointer，State 是全新的，计数自动从 1 开始。
     用 State 承载计数器，本身就精确表达了"计数只在本次运行内有效"这一语义。
+
+    参数 runtime 本实验没有用到，但保留它是为了展示 hook 的签名形状：
+    所有 middleware hook 都接收 (state, runtime)，需要读身份/权限/Store 时
+    就用 runtime.context 和 runtime.store，和 @dynamic_prompt 里的
+    request.runtime 是同一个东西。
     """
-    if not state["messages"]:
-        return None
-
     # 从 State 读出上一轮的计数，+1 后写回。
-    # 第一次进来时该字段还不存在，所以必须给默认值 0，否则 KeyError。
-    count = state.get("model_call_count", 0) + 1
+    # 第一次进来时该字段还不存在（NotRequired），所以必须给默认值 0，
+    # 否则会 KeyError。
+    n = state.get("model_call_count", 0) + 1
 
-    print(
-        f"[before_model] 第 {count} 次即将调用模型 | "
-        f"当前消息数 = {len(state['messages'])} | "
-        f"消息类型 = {[m.type for m in state['messages']]}"
-    )
+    # 打印消息数，用来观察 ReAct 循环的累积过程：
+    # 不触发工具时恒为 1；触发工具后第二轮变成 3（+AIMessage +ToolMessage）。
+    print(f"[before_model] 第 {n} 次调用模型, "
+          f"当前 State 消息数 = {len(state['messages'])}")
 
-    # 返回 dict 即"我要把这些字段合并进 State"。
-    # 注意：这不是 return 给调用方，而是 LangGraph 的 State 更新协议。
-    return {"model_call_count": count}
+    # ← 关键:返回 dict 写入 State
+    # 注意：这不是"return 给调用方"，而是 LangGraph 的 State 更新协议 ——
+    # 框架会把这个 dict 按 reducer 规则合并进 State。messages 字段的 reducer
+    # 是 append（追加），而 model_call_count 这种标量字段默认是覆盖。
+    return {"model_call_count": n}
 
 
-@after_model
-def log_after_model(state: MiddlewareState, runtime) -> dict | None:
+@after_model(state_schema=CallCountState)
+def inspect_model_output(state: CallCountState, runtime: Runtime) -> dict | None:
     """
     在每次调用模型**之后**执行。
 
@@ -257,90 +324,82 @@ def log_after_model(state: MiddlewareState, runtime) -> dict | None:
     刚刚产出、尚未被后续逻辑处理的 AIMessage，因此这里最适合做：
         - 观测模型行为（本实验）
         - 统计 token / 成本
-        - 在消息落盘前拦截或改写（后续实验）
+        - 在消息落盘前拦截或改写（后续实验，本次不做）
 
     与 @dynamic_prompt 的关键区别：
         @dynamic_prompt 由 wrap_model_call 实现，只能在"这次请求"的外层替换
         system message，改完就没了；而本函数可以返回 dict 写进 State，
         改动会被后续所有节点看到。
+
+    为什么能看到 tool_calls：
+        模型"决定要调工具"这个动作，本身就体现为它产出的 AIMessage 上带了
+        tool_calls 字段。所以这里读到非空 tool_calls，就说明接下来
+        条件路由会走向 tools 节点，并再回到 before_model —— 这就是"第 2 次触发"的来源。
     """
-    if not state["messages"]:
-        return None
+    # 只有 AIMessage 才带 tool_calls，HumanMessage / ToolMessage 没有这个属性。
+    # 所以不能用 last.tool_calls 直接取（会 AttributeError），
+    # 要用 getattr 兜底取 None，再用 or [] 归一成列表。
+    last = state["messages"][-1]  # 获取最新的模型输出消息
+    calls = getattr(last, "tool_calls", None) or []
 
-    last_message = state["messages"][-1]
+    print(f"[after_model] 模型产出 tool_calls = {[c['name'] for c in calls]}")
 
-    # 只有 AIMessage 才带 tool_calls，其它类型用 getattr 兜底取 None。
-    # 这里不能用 last_message.tool_calls 直接取——HumanMessage / ToolMessage
-    # 没有这个属性，会 AttributeError。
-    tool_calls = getattr(last_message, "tool_calls", None) or []
-    tool_names = [call["name"] for call in tool_calls]
-
-    print(
-        f"[after_model] 模型产出 tool_calls = {tool_names} | "
-        f"content = {last_message.content!r}"
-    )
-
-    # 额外打印第一条消息的类型，用它证明一件重要的事：
-    # before_model / after_model **不能像 @dynamic_prompt 那样替换 system message**。
-    # 如果真的替换了，这里会看到 'system'，而实测恒为 'human'。
-    print(f"[after_model] messages[0].type = {state['messages'][0].type}（期望 human）")
-
-    return {"last_tool_names": tool_names}
+    # 把本轮请求的工具名记进 State。
+    # 同一个 invoke 内会被后续轮次覆盖，所以最终留下的是**最后一次**模型调用的结果。
+    # 这也解释了为什么请求 B 结束时 last_tool_names == []（最后一轮不再需要工具）。
+    return {"last_tool_names": [c["name"] for c in calls]}
 
 
 # ============================================================================
-# 四、组装 Agent
+# 五、组装 Agent
 # ============================================================================
-def build_agent(store: InMemoryStore, model=None):
+def build_agent(store: InMemoryStore):
     """
     根据配置创建 Agent，但**不执行**用户请求。
 
-    参数 model 允许注入：
-        - 不传时，用 .env 配置的真实模型（走网络、有成本）；
-        - 传入假模型时，可以零成本地确定性地验证 hook 行为。
-    这种"把模型作为参数传进来"的写法就是依赖注入，和 build_store 的思路一致。
-
-    为什么把 store 也作为参数而不是在函数内部新建？
+    为什么把 store 作为参数而不是在函数内部新建？
         因为长期资料需要在"创建 Agent"和"之后直接读 Store 校验"之间共享同一个实例。
+
+    注意这里又新建了一个 ChatOpenAI，而不是复用模块顶层的 llm：
+        这是一种**依赖注入**写法 —— 谁需要模型谁自己声明配置。
+        好处是 build_agent 不依赖模块级全局状态，将来要在同一个进程里
+        为不同请求构造不同配置的 Agent，只改这个函数即可。
+        代价是当前存在两个配置相同的 llm 对象，略有冗余。
     """
-    if model is None:
-        model = ChatOpenAI(
-            model=os.getenv("LLM_MODEL_ID"),
-            api_key=os.getenv("LLM_API_KEY"),
-            base_url=os.getenv("LLM_BASE_URL"),
-        )
+    llm = ChatOpenAI(
+        model=os.getenv("LLM_MODEL_ID"),
+        api_key=os.getenv("LLM_API_KEY"),
+        base_url=os.getenv("LLM_BASE_URL"),
+    )
 
     # create_agent 内部会隐式构建下面这张图（这就是它"隐藏"的 LangGraph 机制）：
     #
-    #     START -> log_before_model.before_model -> model
-    #           -> log_after_model.after_model
+    #     START -> count_model_calls.before_model -> model
+    #           -> inspect_model_output.after_model
     #           -> 条件路由 ─┬─ tools -> 回到 before_model
     #                        └─ END
     #
     # 我们只声明了两个 hook，没有写任何 StateGraph 代码，
     # 但框架自动把它们编译成了图节点并接进了 ReAct 循环。
-    # 想亲眼确认这张图，运行 main() 时会打印 draw_mermaid() 的结果。
+    # 想亲眼确认这张图，可以看 main() 里打印的 draw_mermaid() 结果。
     return create_agent(
-        model=model,
-        # 只保留 get_weather 一个工具：它不依赖 Store，行为完全可预测，
-        # 这样"是否触发工具循环"只取决于模型的决策，不受 Store 内容干扰。
-        tools=[get_weather],
-        middleware=[log_before_model, log_after_model],
-        system_prompt=(
-            "你是一个助手。当用户询问天气时，必须调用 get_weather 工具获取信息，"
-            "不要凭记忆直接回答。"
-        ),
+        model=llm,
+        # 工具集合：get_weather 用于触发工具循环；另外两个依赖 Store，
+        # 保留它们是为了让这个 Agent 的骨架和 @dynamic_prompt 实验一致。
+        tools=[get_weather, get_user_info, save_user_info],
+        middleware=[count_model_calls, inspect_model_output],
+        system_prompt="You are a helpful assistant",
         context_schema=Context,
-        # 在这里统一声明扩展后的 State。
-        # 若删掉这一行，hook 返回的 model_call_count / last_tool_names
-        # 会被静默丢弃（见上方注释中的实测结论）。
-        state_schema=MiddlewareState,
+        # 在这里声明扩展后的 State。
+        # 若删掉这一行（且装饰器上也不声明），hook 返回的
+        # model_call_count / last_tool_names 会被**静默丢弃**（见 CallCountState 注释）。
+        state_schema=CallCountState,
         store=store,
     )
 
 
 # ============================================================================
-# 五、辅助函数
+# 六、辅助函数
 # ============================================================================
 def print_messages(result: dict) -> None:
     """按时间顺序打印这次运行产生的全部消息，便于观察 ReAct 循环轨迹。"""
@@ -352,10 +411,11 @@ def print_state_summary(result: dict) -> None:
     """
     打印 hook 写进 State 的字段。
 
-    这是本实验最关键的验收点：如果这两个值有内容，就证明
-    "before_model / after_model 的返回值真的被当作 State 更新"，
-    而不只是打印了一下。对比 @dynamic_prompt 的实验——那里
-    无论怎么改提示词，最终 State 里都找不到任何痕迹。
+    这是本实验**最关键的验收点**：
+        如果这两个值有内容，就证明"before_model / after_model 的返回值
+        真的被当作 State 更新合并了"，而不只是打印了一下。
+        对比 @dynamic_prompt 的实验 —— 那里无论怎么改提示词，
+        最终 State 里都找不到任何痕迹。
     """
     print("=== 最终 State 摘要 ===")
     print(f"model_call_count = {result.get('model_call_count')}  （模型被调用的次数）")
@@ -363,76 +423,19 @@ def print_state_summary(result: dict) -> None:
 
 
 # ============================================================================
-# 六、路径 A：零 API 成本的确定性自检
-# ============================================================================
-class _ToolCallingFakeModel(GenericFakeChatModel):
-    """
-    可绑定工具的假模型，用于零成本、确定性地驱动一次完整工具循环。
-
-    为什么要子类化？
-        `GenericFakeChatModel` 虽然存在 bind_tools 属性，但 `create_agent` 的
-        绑定路径会走到 ChatModel.bind_tools 的默认实现并抛 NotImplementedError。
-        这里覆写成"返回自己"，让绑定变成空操作，同时按预设脚本依次产出消息。
-
-    这是**测试替身**，只在自检里使用，不参与真实实验流程。
-    """
-
-    def bind_tools(self, tools, **kwargs):
-        return self
-
-
-def run_deterministic_selfcheck() -> None:
-    """
-    用假模型跑一遍完整的工具调用循环，验证 hook 的触发时机与 State 写入。
-
-    这条路径不联网、不产生费用，可以反复运行。它验证的是 **hook 逻辑与图结构**，
-    不是"真实模型是否愿意调用工具"——后者只能由路径 B 覆盖。
-
-    期望输出（已实测）：
-        [before_model] 第 1 次 ... 消息数 = 1
-        [after_model] 模型产出 tool_calls = ['get_weather']
-        [before_model] 第 2 次 ... 消息数 = 3      <- 多了 AIMessage 和 ToolMessage
-        [after_model] 模型产出 tool_calls = []
-        最终 model_call_count = 2
-    """
-    print("\n" + "=" * 70)
-    print("路径 A：确定性自检（假模型，零 API 成本）")
-    print("=" * 70)
-
-    # 假模型的消息队列是"脚本"：第一次产出带 tool_calls 的 AIMessage，
-    # 第二次产出纯文本。这正好模拟"先调工具、再总结"的 ReAct 行为。
-    scripted_messages = [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {"name": "get_weather", "args": {"city": "北京"}, "id": "call_1"}
-            ],
-        ),
-        AIMessage(content="北京今天晴天。"),
-    ]
-
-    agent = build_agent(
-        build_store(),
-        model=_ToolCallingFakeModel(messages=iter(scripted_messages)),
-    )
-
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": "北京今天天气怎么样？"}]},
-        context=Context(user_id="user_2", authority="user"),
-    )
-
-    print_state_summary(result)
-
-    count = result.get("model_call_count")
-    assert count == 2, f"期望 model_call_count == 2，实际 {count}"
-    print("\n[PASS] 自检通过：hook 触发 2 次，且返回值确实写入了 State。")
-
-
-# ============================================================================
-# 七、路径 B：真实模型运行（有 API 成本，属手动验证）
+# 七、运行入口
 # ============================================================================
 def main() -> None:
-    """用真实模型演示 hook 行为。这是手动实验，会产生外部 LLM API 调用与费用。"""
+    """
+    用真实模型演示 hook 行为。
+
+    ⚠️ 这是**手动实验**，会产生外部 LLM API 调用与费用。
+       运行前需确认 .env 与网络可用。仓库当前没有测试框架，
+       所以这里的结果属于手动验证，不是自动化测试。
+    """
+    # .env 已在模块顶部加载（见文件开头第一段的解释），这里不再重复调用。
+
+    # 同一个程序运行期间只创建一份 Store 和 Agent。
     store = build_store()
     agent = build_agent(store)
 
@@ -441,27 +444,48 @@ def main() -> None:
     print("=== create_agent 生成的图结构（静态） ===")
     print(agent.get_graph().draw_mermaid())
 
-    # ---- 请求 1：会触发工具调用，期望两个 hook 各触发 2 次 ----
-    print("\n=== 请求 1：问天气（期望触发工具循环） ===")
-    result_01 = agent.invoke(
-        {"messages": [{"role": "user", "content": "北京今天天气怎么样？"}]},
-        context=Context(user_id="user_2", authority="user"),
+    # ---- 请求 1：不触发工具，期望两个 hook 各只触发 1 次 ----
+    print("\n=== 请求 1：寒暄（期望不触发工具循环） ===")
+    result01 = agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "你好",
+                }
+            ]
+        },
+        context=Context(
+            user_id="user_1",
+            authority="user",
+        )
     )
-    print_messages(result_01)
-    print_state_summary(result_01)
+    print_messages(result01)
+    print_state_summary(result01)
 
-    # ---- 请求 2：不需要工具，期望两个 hook 各只触发 1 次 ----
+    print("\n========= 分割线 =========")
+
+    # ---- 请求 2：触发工具，期望两个 hook 各触发 2 次 ----
     # 这次调用也验证了：没有 checkpointer 时，上一次的计数不会带过来，
     # model_call_count 会重新从 1 开始。
-    print("\n=== 请求 2：寒暄（期望不触发工具） ===")
-    result_02 = agent.invoke(
-        {"messages": [{"role": "user", "content": "你好，请用一句话介绍你自己。"}]},
-        context=Context(user_id="user_2", authority="user"),
+    print("\n=== 请求 2：问天气（期望触发工具循环） ===")
+    result02 = agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "北京今天天气怎么样？",
+                }
+            ]
+        },
+        context=Context(
+            user_id="user_2",
+            authority="user",
+        )
     )
-    print_messages(result_02)
-    print_state_summary(result_02)
+    print_messages(result02)
+    print_state_summary(result02)
 
 
 if __name__ == "__main__":
-    # 默认跑零成本自检。想跑真实模型时，把下面这行改成 main()。
-    run_deterministic_selfcheck()
+    main()

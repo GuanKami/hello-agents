@@ -131,7 +131,10 @@ dive-into-langgraph/      -> 是独立的 git 仓库（课程源码），与根�
 ```text
 a498db3  chore: 建立版本控制基线       <- 12 个源码文件的初始快照，可回滚到此
 5176f14  feat(middleware): before_model/after_model 真正写入 Agent State
+49cce20  docs(agents): 同步 before_model/after_model 实验完成状态与 git 安全网
 ```
+
+注意：`5176f14` 提交的 `langgraph_middleware_hooks_demo.py` 是一个**已被维护者废弃的版本**（含假模型自检路径）。维护者随后按自己的版本重写了该文件，当前工作区版本才是有效版本。**不要用 `git checkout` 把它恢复到 `5176f14`。**
 
 `.gitignore` 排除项（已用 `git check-ignore` 逐条验证生效）：
 
@@ -318,35 +321,50 @@ def wrapped(_self, request, handler):
 
 ### 4.8 `langgraph_middleware_hooks_demo.py`：`before_model` / `after_model`
 
-当前状态：**核心机制已验证（零 API 成本的确定性路径），真实模型路径 B 尚未人工运行。**
+当前状态：**核心机制已由真实模型运行实测通过（2026-09-10）。两个学习目标均已验证。**
 
 文件结构：
 
 ```text
 文件头十项 docstring（按 6.4.3 规范）
-MiddlewareState(AgentState)          <- 扩展 model_call_count / last_tool_names
-build_store()                        <- 依赖注入，便于将来换 SqliteStore
-log_before_model  (@before_model)    <- 返回 {"model_call_count": n}
-log_after_model   (@after_model)     <- 返回 {"last_tool_names": [...]}
-build_agent(store, model=None)       <- model 可注入，用于零成本自检
-run_deterministic_selfcheck()        <- 路径 A：假模型，零成本，确定性
-main()                               <- 路径 B：真实模型，有 API 成本
+CallCountState(AgentState)            <- 扩展 model_call_count / last_tool_names
+build_store()                         <- 依赖注入，便于将来换 SqliteStore
+count_model_calls   (@before_model)   <- 返回 {"model_call_count": n}
+inspect_model_output(@after_model)    <- 返回 {"last_tool_names": [...]}
+build_agent(store)                    <- 组装 create_agent
+print_messages() / print_state_summary()
+main()                                <- 真实模型运行，有 API 成本
 ```
 
-**已实测通过的验证（路径 A，不联网、可重复运行）**：
+说明：本实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此验证不是确定性的，每次运行都会产生真实的 LLM API 调用与费用，且结果受模型当时行为影响。文件内没有 `run_deterministic_selfcheck()` 之类的自检路径。
+
+**已实测通过的验证（真实模型，符合预期）**：
 
 ```text
-[before_model] 第 1 次即将调用模型 | 消息数 = 1 | 消息类型 = ['human']
+请求 1（"你好"，不触发工具）：
+[before_model] 第 1 次调用模型, 当前 State 消息数 = 1
+[after_model]  模型产出 tool_calls = []
+最终 model_call_count = 1，last_tool_names = []
+
+请求 2（"北京今天天气怎么样？"，触发工具）：
+[before_model] 第 1 次调用模型, 当前 State 消息数 = 1
 [after_model]  模型产出 tool_calls = ['get_weather']
-[before_model] 第 2 次即将调用模型 | 消息数 = 3 | 消息类型 = ['human', 'ai', 'tool']
+[before_model] 第 2 次调用模型, 当前 State 消息数 = 3
 [after_model]  模型产出 tool_calls = []
 最终 model_call_count = 2，last_tool_names = []
 ```
 
+两个学习目标的验证结果：
+
+1. **触发次数 = 模型调用次数**：不触发工具时 hook 各 1 次；触发工具时各 2 次。
+2. **返回 dict 确实写入 State**：`model_call_count` 由 `result.get(...)` 从 `invoke` 的**返回值**中读出（请求 1 得 1，请求 2 得 2），证明 patch 被合并进 State 且 invoke 返回后依然可读。这是与 `@dynamic_prompt`（不写 State）的分界线。
+
+两处 `last_tool_names = []` 属预期，不是"工具未被调用"：该字段是**标量字段，reducer 为覆盖**，第 1 轮写入 `['get_weather']` 后被第 2 轮的 `[]` 覆盖。因此它表示"**最后一次**模型调用请求了哪些工具"，不是本次运行的累计工具使用记录。
+
 **已实测确认的图结构**（`agent.get_graph()` 的节点与边）：
 
 ```text
-节点: model, tools, log_before_model.before_model, log_after_model.after_model
+节点: model, tools, count_model_calls.before_model, inspect_model_output.after_model
 边:   START -> before_model -> model -> after_model
       after_model --条件--> END
       after_model --条件--> tools
@@ -365,7 +383,7 @@ main()                               <- 路径 B：真实模型，有 API 成本
 
 **必须记住的坑**：hook 返回的自定义 State 字段**必须**出现在合并后的 State schema 中，否则会被**静默丢弃且不报错**。已实测：未声明 `state_schema` 时返回 `{"model_call_count": 99}`，最终读出 `None`；声明后读出 `99`。
 
-**未覆盖的部分**：真实模型是否愿意调用工具（路径 B，属手动验证）；多个同类型 middleware 的组合顺序；`can_jump_to` 跳转；消息裁剪。
+**未覆盖的部分**：多个同类型 middleware 的组合顺序；`can_jump_to` 跳转；消息裁剪；`wrap_model_call` / `wrap_tool_call`。本实验刻意不使用假模型 / Mock，因此不存在"不联网、可重复"的确定性验证路径——每次验证都是一次真实模型运行。
 
 ### 4.9 `langgraph_react.py`
 
@@ -459,8 +477,8 @@ SqliteStore
 
 **Middleware 阶段已完成的最小实验**：
 
-- **`before_model` / `after_model` 写入 State**（`langgraph_middleware_hooks_demo.py`）：已实测确认两个 hook 被编译成真正的图节点、位于 ReAct 循环内部、返回的 dict 会合并进 State 且 invoke 返回后可读；触发次数等于模型调用次数。机制细节见 4.8 与 5.5 节。
-- 仍未做：真实模型路径 B 的人工运行（有 API 成本），以及 `wrap_model_call` / `wrap_tool_call`。
+- **`before_model` / `after_model` 写入 State**（`langgraph_middleware_hooks_demo.py`）：已由**真实模型运行**实测确认两个 hook 被编译成真正的图节点、位于 ReAct 循环内部、返回的 dict 会合并进 State 且 invoke 返回后可读；触发次数等于模型调用次数。两个学习目标均已验证。机制细节见 4.8 与 5.5 节。
+- 仍未做：`wrap_model_call` / `wrap_tool_call`。
 
 根据 `dive-into-langgraph` 课程，以下章节标记为已完成：
 
@@ -479,7 +497,7 @@ SqliteStore
 ```text
 计划:  SqliteStore 持久化验收 -> Context Engineering -> Middleware
 实际:  Context Engineering（Runtime+Store / State / @dynamic_prompt）已完成
-       -> Middleware（dynamic_prompt / before_model / after_model）已完成核心机制验证
+       -> Middleware（dynamic_prompt / before_model / after_model）已完成，并由真实模型运行实测通过
        -> SqliteStore 持久化验收【被跳过，仍未执行】
 ```
 
@@ -501,7 +519,7 @@ SqliteStore
 2. Context Engineering                                 [已完成]
 3. Middleware                                          [进行中]
    -> dynamic_prompt                                   [已完成]
-   -> before_model / after_model                       [已完成核心机制验证]
+   -> before_model / after_model                       [已完成，真实模型实测通过]
    -> wrap_model_call                                  [下一步，未开始]
    -> wrap_tool_call                                   [未开始]
 4. Human-in-the-loop
@@ -854,8 +872,8 @@ Store / SqliteStore
 
 ### 12.1 当前学习任务（最高优先级）
 
-- **`before_model` / `after_model` 实验已基本完成**（`langgraph_middleware_hooks_demo.py`）：hook 已真正写入 State，核心机制已由零 API 成本的确定性路径 A 实测验证，文件头已按 6.4.3 补齐十项 docstring，基类已改用 `AgentState`。详见 4.8 节。
-- 剩余可选项：用真实模型跑一次路径 B（把 `__main__` 里的 `run_deterministic_selfcheck()` 改成 `main()`），确认真实模型确实会调用 `get_weather`。**这是手动验证，会产生 API 费用**，且免费模型可能不调用工具。
+- **`before_model` / `after_model` 实验已完成**（`langgraph_middleware_hooks_demo.py`）：hook 已真正写入 State，两个学习目标均已由**真实模型运行**实测通过（触发次数 = 模型调用次数；返回的 dict 合并进 State 且 invoke 返回后可读）。文件头已按 6.4.3 补齐十项 docstring，基类为 `AgentState` 的扩展 `CallCountState`。详见 4.8 节。
+- 该实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此每次验证都会产生真实 API 调用与费用，结果受模型当时行为影响，不是确定性的。文件内没有自检路径。
 - **下一步实验：`wrap_model_call`**。它已在 `@dynamic_prompt` 中被隐性使用过（见 4.7 节），因此重点是把已知机制显式化：`handler` 回调、`request.override`、重试 / 短路 / 降级。`before_model` / `after_model` 可作为它的观测抓手。
 
 ### 12.2 被跳过的前置任务（需补做）
@@ -874,7 +892,7 @@ Store / SqliteStore
 
 - 将 `langgraph`、`pydantic` 等直接使用的依赖补充到 `requirements.txt`。
 - 新增根目录 `README.md`，记录实验顺序、架构图、运行前提和验证结果。
-- 为 StateGraph 路由、工具权限、资料合并和 Store 隔离建立不依赖真实模型的最小测试。**本仓库已验证 `create_agent` + 假模型（子类化 `GenericFakeChatModel` 并覆写 `bind_tools`）可行**，可照此方式编写；参见 `langgraph_middleware_hooks_demo.py` 的 `run_deterministic_selfcheck()`。
+- 为 StateGraph 路由、工具权限、资料合并和 Store 隔离建立最小测试，避免每次验证都产生外部调用和费用（原则见 10.2 节）。当前仓库**尚未建立**任何此类测试；已有的 Context / Middleware 实验全部采用真实模型手动验证，不使用假模型 / Mock。
 
 ### 12.5 后续学习任务
 
