@@ -1,0 +1,6 @@
+openai
+python-dotenv
+google-search-results
+ipython
+langchain>=1.0
+langchain-openai

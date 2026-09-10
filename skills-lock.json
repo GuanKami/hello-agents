@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "dive-into-langgraph": {
+      "source": "luochang212/dive-into-langgraph",
+      "sourceType": "github",
+      "skillPath": "skills/dive-into-langgraph/SKILL.md",
+      "computedHash": "d1282d7fb17794a246f0f80c541d8b94c42e9c6795ff9f69d5c04aa6848e4c87"
+    }
+  }
+}

@@ -1,0 +1,54 @@
+# ===== 敏感配置 =====
+# .env 含 LLM_API_KEY / SERPAPI_API_KEY 等真实凭据，绝不能提交
+.env
+.env.*
+!.env.example
+
+# ===== Python 运行产物 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+ENV/
+
+# ===== 本地数据库与运行产物 =====
+# short-memory.db 是 checkpoint 历史产物；*.db / *.sqlite* 均属本地数据
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ===== 测试与覆盖率 =====
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== 本地工具配置 =====
+.omo/
+# Claude Code 的本地权限设置（含本机绝对路径与批准记录），属本地配置
+.claude/settings.local.json
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+
+# ===== 课程资料目录 =====
+# dive-into-langgraph/ 是独立的 git 仓库（课程源码），
+# 对于根仓库而言它是一个嵌套仓库：不跟踪其内容，避免误提交课程改动。
+dive-into-langgraph/
