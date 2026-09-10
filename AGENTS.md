@@ -66,7 +66,8 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_context_demo.py                           # Runtime + Store -> Model Context
 ├── langgraph_state_context_demo.py                     # State -> Model Context
 ├── langgraph_middleware_dynamic_prompt_demo.py         # @dynamic_prompt
-├── langgraph_middleware_hooks_demo.py                  # before_model / after_model（实验进行中）
+├── langgraph_middleware_hooks_demo.py                  # before_model / after_model（已验证）
+├── .gitignore            # 版本控制排除规则，见 3.4 节
 ├── requirements.txt
 ├── short-memory.db       # 本地 SQLite 运行产物；当前无脚本写入，见 4.11 节
 ├── skills-lock.json      # 本地 Skill 相关锁定信息
@@ -116,19 +117,36 @@ llm_client.py
 - **文档必须以当前代码和可验证结果为依据。** 无法验证的能力要写明“未验证”，不得根据文件名或过往描述推断。
 - 修改代码后未同步文档，视为任务未完成。
 
-### 3.4 版本控制现状（风险提示）
+### 3.4 版本控制现状
 
 截至 2026 年 9 月 10 日：
 
 ```text
-根目录 hello-agents/      -> 不是 git 仓库，没有 .git，也没有 .gitignore
+根目录 hello-agents/      -> 已建立 git 仓库（2026-09-10），有 .gitignore
 dive-into-langgraph/      -> 是独立的 git 仓库（课程源码），与根项目实验代码无关
 ```
 
-影响：
+已建立的提交：
 
-- 根目录实验代码**没有任何版本历史**，修改后无法通过 git 回滚。
-- 修改重要文件前，应先自行备份，或先完成“新增 `.gitignore` + 建立 git 仓库”这一 TODO。
+```text
+a498db3  chore: 建立版本控制基线       <- 12 个源码文件的初始快照，可回滚到此
+5176f14  feat(middleware): before_model/after_model 真正写入 Agent State
+```
+
+`.gitignore` 排除项（已用 `git check-ignore` 逐条验证生效）：
+
+```text
+.env                          <- 含真实密钥，绝不提交
+.venv/  __pycache__/          <- 环境与运行产物
+*.db  (含 short-memory.db)    <- 本地数据库
+.idea/  .omo/                 <- 本地工具与 IDE 配置
+.claude/settings.local.json   <- 含本机绝对路径的本地权限配置
+dive-into-langgraph/          <- 嵌套的课程仓库，不纳入根仓库跟踪
+```
+
+注意事项：
+
+- 根目录现在有版本历史，**改动实验代码前后可用 `git diff` / `git checkout` 对照与回滚**。
 - **不要**在根目录用 git 命令操作 `dive-into-langgraph/`，它们是两个独立仓库。
 - `dive-into-langgraph/` 内已存在的未提交修改属于课程内容，除非维护者明确要求，不要提交或还原。
 
@@ -174,16 +192,7 @@ langchain-openai
 - `MODEL_PROVIDER`
 - `SERPAPI_API_KEY`
 
-仓库当前没有根目录 `.gitignore`。建立版本控制或提交代码前，应至少排除：
-
-```text
-.env
-.venv/
-__pycache__/
-.idea/
-.omo/
-*.db
-```
+仓库已有根目录 `.gitignore`（2026-09-10 新增，内容与排除项见 3.4 节）。新增敏感配置或运行产物目录时，必须同步补充排除规则，并用 `git check-ignore -v <路径>` 验证生效。
 
 ### 4.3 `tools.py`
 
@@ -307,27 +316,45 @@ def wrapped(_self, request, handler):
 
 因此它生成的是 `wrap_model_call` / `awrap_model_call`，**不产生任何图节点，也不写入 State**。这与 `before_model` / `after_model`（真正的图节点，可写 State）是本质区别，是后续 Middleware 学习的关键分界。
 
-### 4.8 `langgraph_middleware_hooks_demo.py`：`before_model` / `after_model`（进行中）
+### 4.8 `langgraph_middleware_hooks_demo.py`：`before_model` / `after_model`
 
-当前状态：**实验进行中，尚未完成验证。**
+当前状态：**核心机制已验证（零 API 成本的确定性路径），真实模型路径 B 尚未人工运行。**
 
-- 文件已存在并包含 `build_store()` / `build_agent()` / `main()` 骨架，以及注册好的 `@before_model` 与 `@after_model`。
-- 但两个 hook 目前都 `return None`，只做 `print`，**没有真正写入 State**，因此尚未触及 Middleware 最核心的能力。
-- 已执行过的验证：模块可导入、`build_agent(store)` 可构建、`draw_mermaid()` 可输出图结构（节点为 `{middleware名}.before_model` 与 `{middleware名}.after_model`）。
-- **尚未执行任何真实模型调用**，hook 的运行时行为未验证。
-- 已知待修正：草稿从 `langgraph.graph` 导入 `MessagesState`，但 `create_agent` 的 hook 应使用 `langchain.agents.middleware.AgentState` 作为基类（`create_agent` 依赖 `AgentState` 的 `jump_to` / `structured_response` 字段）。
-
-`before_model` / `after_model` 在 `create_agent` 内部的真实位置（依据 `langchain/agents/factory.py` 源码）：
+文件结构：
 
 ```text
-START
-  -> [before_agent ...]        整次运行只跑一次
-  -> before_model              循环入口：每次调用模型前都跑
-  -> model
-  -> after_model               每轮迭代出口
-  -> 条件路由 ─┬─ tools -> 回到 before_model
-               └─ [after_agent] -> END
+文件头十项 docstring（按 6.4.3 规范）
+MiddlewareState(AgentState)          <- 扩展 model_call_count / last_tool_names
+build_store()                        <- 依赖注入，便于将来换 SqliteStore
+log_before_model  (@before_model)    <- 返回 {"model_call_count": n}
+log_after_model   (@after_model)     <- 返回 {"last_tool_names": [...]}
+build_agent(store, model=None)       <- model 可注入，用于零成本自检
+run_deterministic_selfcheck()        <- 路径 A：假模型，零成本，确定性
+main()                               <- 路径 B：真实模型，有 API 成本
 ```
+
+**已实测通过的验证（路径 A，不联网、可重复运行）**：
+
+```text
+[before_model] 第 1 次即将调用模型 | 消息数 = 1 | 消息类型 = ['human']
+[after_model]  模型产出 tool_calls = ['get_weather']
+[before_model] 第 2 次即将调用模型 | 消息数 = 3 | 消息类型 = ['human', 'ai', 'tool']
+[after_model]  模型产出 tool_calls = []
+最终 model_call_count = 2，last_tool_names = []
+```
+
+**已实测确认的图结构**（`agent.get_graph()` 的节点与边）：
+
+```text
+节点: model, tools, log_before_model.before_model, log_after_model.after_model
+边:   START -> before_model -> model -> after_model
+      after_model --条件--> END
+      after_model --条件--> tools
+      after_model --条件--> before_model
+      tools --条件--> before_model
+```
+
+由此可见 `tools -> before_model -> model -> after_model` 构成循环，这正是"模型调用几次，两个 hook 就各触发几次"的源码级原因。
 
 关键源码事实：
 
@@ -337,6 +364,8 @@ START
 - `state_schema=` 是装饰器的关键字参数（`before_model(func=None, *, state_schema=None, tools=None, can_jump_to=None, name=None)`）。它只做声明，不做类型检查。
 
 **必须记住的坑**：hook 返回的自定义 State 字段**必须**出现在合并后的 State schema 中，否则会被**静默丢弃且不报错**。已实测：未声明 `state_schema` 时返回 `{"model_call_count": 99}`，最终读出 `None`；声明后读出 `99`。
+
+**未覆盖的部分**：真实模型是否愿意调用工具（路径 B，属手动验证）；多个同类型 middleware 的组合顺序；`can_jump_to` 跳转；消息裁剪。
 
 ### 4.9 `langgraph_react.py`
 
@@ -428,9 +457,10 @@ SqliteStore
 - **State → Model Context**（`langgraph_state_context_demo.py`）：自定义 `AgentState` 扩展字段 `task_mode`，新增 `classify_task` 节点写入 State，模型节点依据 State 切换任务策略提示词。已理解 Context / Store 与 State 在生命周期和语义上的边界差异。
 - **`@dynamic_prompt`**（`langgraph_middleware_dynamic_prompt_demo.py`）：在 `create_agent` 中通过 `ModelRequest` 读取 `runtime.context` / `runtime.store` 生成本次系统提示词。已理解它是 `wrap_model_call` 的便捷封装。
 
-**Middleware 阶段进行中**：
+**Middleware 阶段已完成的最小实验**：
 
-- `before_model` / `after_model` 已在 `langgraph_middleware_hooks_demo.py` 中注册并确认可编译成图节点，但**尚未写入 State，也未经过真实模型调用验证**。详见 4.8 节。
+- **`before_model` / `after_model` 写入 State**（`langgraph_middleware_hooks_demo.py`）：已实测确认两个 hook 被编译成真正的图节点、位于 ReAct 循环内部、返回的 dict 会合并进 State 且 invoke 返回后可读；触发次数等于模型调用次数。机制细节见 4.8 与 5.5 节。
+- 仍未做：真实模型路径 B 的人工运行（有 API 成本），以及 `wrap_model_call` / `wrap_tool_call`。
 
 根据 `dive-into-langgraph` 课程，以下章节标记为已完成：
 
@@ -449,18 +479,18 @@ SqliteStore
 ```text
 计划:  SqliteStore 持久化验收 -> Context Engineering -> Middleware
 实际:  Context Engineering（Runtime+Store / State / @dynamic_prompt）已完成
-       -> Middleware（before_model / after_model）进行中
-       -> SqliteStore 持久化验收【被跳过，尚未执行】
+       -> Middleware（dynamic_prompt / before_model / after_model）已完成核心机制验证
+       -> SqliteStore 持久化验收【被跳过，仍未执行】
 ```
 
 **偏离事实（截至 2026 年 9 月 10 日）**：
 
 - SqliteStore 持久化验收**没有执行**。`langgraph_context_demo.py`、`langgraph_state_context_demo.py`、`langgraph_middleware_dynamic_prompt_demo.py`、`langgraph_middleware_hooks_demo.py` **全部仍在使用 `InMemoryStore`**，因此所有长期资料实验的数据都只在单个 Python 进程内有效，退出即丢失。
-- 这是**真实的顺序偏离，不是文档表述问题**。前一轮 Agent 直接进入了 Context Engineering，未先完成跨进程持久化验收。
+- 这是**真实的顺序偏离，不是文档表述问题**。前几轮 Agent 直接进入了 Context Engineering，未先完成跨进程持久化验收。
 
 **待决策**：SqliteStore 持久化验收应作为独立实验补做，还是在 Middleware 阶段告一段落后补做。补做本身不是新概念，只是把 Store 后端从 `InMemoryStore` 换成 `SqliteStore`，并验证"第一次运行保存、结束 Python、第二次运行用新 `thread_id` 与相同 `user_id` 仍能读取"。
 
-当前重点：完成 `before_model` / `after_model` 实验（让 hook 真正写入 State 并验证触发时机）。
+当前重点：进入 `wrap_model_call`（下一个 Middleware hook），或先补做 SqliteStore 持久化验收。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -471,8 +501,8 @@ SqliteStore
 2. Context Engineering                                 [已完成]
 3. Middleware                                          [进行中]
    -> dynamic_prompt                                   [已完成]
-   -> before_model / after_model                       [进行中，当前重点]
-   -> wrap_model_call                                  [未开始]
+   -> before_model / after_model                       [已完成核心机制验证]
+   -> wrap_model_call                                  [下一步，未开始]
    -> wrap_tool_call                                   [未开始]
 4. Human-in-the-loop
    -> interrupt
@@ -824,9 +854,9 @@ Store / SqliteStore
 
 ### 12.1 当前学习任务（最高优先级）
 
-- **完成 `before_model` / `after_model` 实验**（`langgraph_middleware_hooks_demo.py`，当前重点）：让两个 hook 真正返回 dict 写入 State，并验证触发时机（触发工具的请求各触发 2 次，不触发的各 1 次）。详见 4.8 节与 5.5 节。
-- 该文件同时需要修正：把 `from langgraph.graph import MessagesState` 改为使用 `langchain.agents.middleware` 的 `AgentState` 作为自定义 State 基类。
-- 为该文件补齐符合 6.4.3 要求的文件头 docstring（十项齐全）。
+- **`before_model` / `after_model` 实验已基本完成**（`langgraph_middleware_hooks_demo.py`）：hook 已真正写入 State，核心机制已由零 API 成本的确定性路径 A 实测验证，文件头已按 6.4.3 补齐十项 docstring，基类已改用 `AgentState`。详见 4.8 节。
+- 剩余可选项：用真实模型跑一次路径 B（把 `__main__` 里的 `run_deterministic_selfcheck()` 改成 `main()`），确认真实模型确实会调用 `get_weather`。**这是手动验证，会产生 API 费用**，且免费模型可能不调用工具。
+- **下一步实验：`wrap_model_call`**。它已在 `@dynamic_prompt` 中被隐性使用过（见 4.7 节），因此重点是把已知机制显式化：`handler` 回调、`request.override`、重试 / 短路 / 降级。`before_model` / `after_model` 可作为它的观测抓手。
 
 ### 12.2 被跳过的前置任务（需补做）
 
@@ -844,8 +874,7 @@ Store / SqliteStore
 
 - 将 `langgraph`、`pydantic` 等直接使用的依赖补充到 `requirements.txt`。
 - 新增根目录 `README.md`，记录实验顺序、架构图、运行前提和验证结果。
-- **新增 `.gitignore` 并建立根目录 git 仓库**：当前根目录没有任何版本控制，改错无法回滚（见 3.4 节）。这是改动实验代码前的安全保障。
-- 为 StateGraph 路由、工具权限、资料合并和 Store 隔离建立不依赖真实模型的最小测试（可用 `create_agent` + Fake Model 方式，已在本仓库验证可行）。
+- 为 StateGraph 路由、工具权限、资料合并和 Store 隔离建立不依赖真实模型的最小测试。**本仓库已验证 `create_agent` + 假模型（子类化 `GenericFakeChatModel` 并覆写 `bind_tools`）可行**，可照此方式编写；参见 `langgraph_middleware_hooks_demo.py` 的 `run_deterministic_selfcheck()`。
 
 ### 12.5 后续学习任务
 
