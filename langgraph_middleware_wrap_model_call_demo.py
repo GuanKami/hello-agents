@@ -406,6 +406,10 @@ def main() -> None:
     print(agent.get_graph().draw_mermaid())
 
     # ---- 请求 1：不触发工具，期望两个 hook 各只触发 1 次 ----
+
+    # 清零，避免受到前面请求统计结果的影响。
+    provider_call_count["value"] = 0
+
     print("\n=== 请求 1：寒暄（期望不触发工具循环） ===")
     result01 = agent.invoke(
         {
@@ -429,7 +433,12 @@ def main() -> None:
     # ---- 请求 2：触发工具，期望两个 hook 各触发 2 次 ----
     # 这次调用也验证了：没有 checkpointer 时，上一次的计数不会带过来，
     # model_call_count 会重新从 1 开始。
+
+    # 重新清零，只观察本次请求。
+    provider_call_count["value"] = 0
+
     print("\n=== 请求 2：问天气（期望触发工具循环） ===")
+
     result02 = agent.invoke(
         {
             "messages": [
