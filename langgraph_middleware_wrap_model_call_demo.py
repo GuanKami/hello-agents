@@ -1,121 +1,7 @@
-"""
-实验名称：before_model / after_model 写入 Agent State
-
-实验目标：
-    1. 观察 @before_model / @after_model 在 create_agent 内部 ReAct 循环中的真实触发
-       时机，证明"hook 触发次数 == 模型调用次数"。
-    2. 验证"hook 返回的 dict 会被当作 State 更新合并进 Agent State"，与普通图节点的
-       返回值语义一致。
-
-解决的问题：
-    上一个实验 @dynamic_prompt 只能改"模型这一次看到什么提示词"：改动不落盘、State 里
-    查不到、下次调用就没了。本实验回答一个更根本的问题 ——
-    Middleware 能不能真正修改工作流状态？改完在哪里能被读到？
-
-使用的 Agent 概念：
-    Middleware hook（before_model / after_model）；create_agent 隐式构建的 ReAct 循环；
-    State schema 的声明与合并；AgentState 与 MessagesState 的区别。
-
-系统架构（两个自写 hook + 一个复现课程的模型选择中间件）：
-
-    START
-      -> count_model_calls.before_model          <- 自写 hook，循环入口（图节点）
-      -> model                                   <- create_agent 内部的模型节点
-      │      └─ dynamic_model_selection          <- wrap_model_call 包裹器
-      │            └─ handler(request) -> 真实 LLM 调用
-      -> inspect_model_output.after_model        <- 自写 hook，循环出口（图节点）
-      -> 条件路由 ─┬─ 有 tool_calls -> tools -> 回到 before_model
-                   └─ 无 tool_calls -> END
-
-    State 新增两个字段：
-        model_call_count : before_model 每轮 +1
-        last_tool_names  : after_model 记录本轮模型请求了哪些工具
-
-    层叠关系（已由运行时打印顺序实证）：包裹器在**模型节点内部**，图节点在外：
-        [before_model]（节点）-> message_count / model_name（包裹器）-> [after_model]（节点）
-    记住这个次序，因为它决定了一个反直觉结论：包裹器短路（不调用 handler）时，
-    before_model **早就执行完了**，所以 before_model 的计数**不能**用来判断
-    模型是否真的被调用 —— 那正是下一步 wrap_model_call 实验的验收点（AGENTS.md 12.1 节）。
-
-实现方式：
-    1. CallCountState 继承框架自带的 AgentState，追加上述两个字段。
-    2. 用 @before_model / @after_model 装饰两个函数，各自返回 dict 作为 State patch。
-    3. create_agent(..., state_schema=CallCountState) 把扩展字段并进整图 State。
-    4. main() 发两种请求做对照：寒暄（不触发工具）与一段自带历史的追问。
-    5. 另外注册一个 @wrap_model_call 中间件 dynamic_model_selection，复现课程
-       3.middleware.ipynb 第一章"预算控制"：消息数超过阈值就换低费率模型。
-       它**不是本实验的学习目标**，见下方"附带验证"。
-
-验证方式（手动实验，会产生真实 LLM API 调用与费用）：
-    运行 main() 肉眼核对。请求 B 的关键是第 2 次触发比第 1 次多 2 条消息。
-
-        请求 A（"你好"，State 初始 1 条消息）：
-              hook 各 1 次, 消息数 = 1, tool_calls = [], model_call_count = 1
-
-        请求 B（自带 5 条历史的追问，State 初始 5 条消息）：
-              第 1 次: 消息数 = 5, tool_calls = ['get_user_info']（实测值）
-              第 2 次: 消息数 = 7, tool_calls = []
-              最终 model_call_count = 2
-
-    为什么第 2 次比第 1 次多 2：ReAct 一轮会 append 两条 —— 1 条带 tool_calls 的
-    AIMessage（行动）+ 1 条 ToolMessage（观察）。必须 append 进 state["messages"]：
-    LLM 是无状态的，不重发完整历史模型就会重复调用工具直到死循环。
-    这里不含模型第 2 次产出的最终回答，因为 hook 在"调用模型之前"读 State。
-
-    ⚠️ 实测记录：请求 B 问的是天气，但模型调的是 get_user_info 而不是 get_weather，
-    之后反问"您想知道哪个城市的天气"。所以这次运行**没有**覆盖 get_weather 路径，
-    只证明了工具循环被触发。选哪个工具由模型决定，不可控 —— 这属于"模型不配合"，
-    不是 hook 配置错误。
-
-学习总结（已实测确认）：
-    1. 两个 hook 被编译成**真正的图节点**，节点名形如 {名字}.before_model，
-       用 agent.get_graph().draw_mermaid() 可以看到。
-    2. 它们位于循环内部：tools -> before_model -> model -> after_model。
-    3. 返回的 dict 会合并进 State，且 **invoke 返回后依然可读**。这是与 @dynamic_prompt
-       的本质区别 —— 后者由 wrap_model_call 实现，只改本次请求的 system message，不写 State。
-    4. 图节点与包裹器的层叠关系已由打印顺序实证：before_model（节点）-> 包裹器 ->
-       after_model（节点）。包裹器在**模型节点内部**，所以它做的决定（换模型、短路
-       不发请求）对 hook 不可见：hook 该触发几次还是几次。
-
-附带验证：课程 3.middleware.ipynb 第一章"预算控制"（已复现）
-    dynamic_model_selection 用 @wrap_model_call 实现：读 request.state["messages"] 的
-    长度，超过阈值就 request.override(model=basic_model)，否则用 advanced_model。
-    实测：消息数 = 1 时用 advanced_model；消息数 = 5 时切到 basic_model，与
-    `message_count > 4` 这个阈值一致。三件事一次验证到位：
-
-        1. wrap_model_call 里能**读** request.state（只读，不能写）。
-        2. request.override(model=...) 能替换本次调用的模型。
-        3. handler(request) 才真正发起调用；不调用 handler 就没有请求。
-
-    尚未覆盖：handler 被调用 **0 次**（短路）与 **N 次**（重试）。前者是下一步
-    wrap_model_call 实验的唯一新概念，见 AGENTS.md 12.1 节。
-
-    ⚠️ 能读 request.state 不等于能写：wrap_model_call 是包裹器不是图节点，它**没有**
-    State 更新通道 —— 想把结果落进 State，只能用 before_model / after_model。
-
-已知限制：
-    - Store 用 InMemoryStore，资料只在当前进程内有效。本文件刻意保留它（两个 hook 都没
-      用到 Store），要跨进程持久化只需改 build_store()，见 AGENTS.md 12.2 节。
-    - 没有 checkpointer：字段只在单次 invoke 内有效，第二次请求的计数从 1 重新开始。
-      这是刻意设计，不是缺陷。
-    - 只注册一个 before_model / 一个 after_model，未验证多个同类型 middleware 的组合
-      顺序（多个 after_model 是**逆序**串联的，属栈式包裹）。
-    - 未验证 can_jump_to 跳转、消息裁剪等更高级用法。
-      （"模型切换"已由 dynamic_model_selection 验证，见上方"附带验证"。）
-    - 依赖模型"愿意调用工具"：小模型可能直接凭记忆回答天气，那样只触发 1 次。这属于
-      模型不配合，不是 hook 配置错误。
-    - 刻意只用真实模型验证，不引入假模型 / Mock：每次验证都产生真实 API 费用，结果受
-      模型当时行为影响，不可完全复现。
-
-后续优化方向：
-    - （可选）把 Store 换成 SqliteStore，验证跨进程资料能否被 hook 读到。该组合尚未验证
-      （SqliteStore 机制本身已在课程 Notebook 6.context 第三节掌握）。
-    - 增加第二个 before_model，观察多个同类型 hook 的执行顺序。
-    - 尝试 @before_model(can_jump_to=["end"]) + 返回 Command，为 HITL 做铺垫。
-"""
+import json
 import os
 
-from typing import NotRequired
+from typing import Any, NotRequired
 from dotenv import load_dotenv
 
 from langchain.agents import create_agent
@@ -123,8 +9,83 @@ from langchain.agents.middleware import before_model, after_model, wrap_model_ca
 from langchain_openai import ChatOpenAI
 from langgraph.store.memory import InMemoryStore
 from langgraph.runtime import Runtime
+from langchain.messages import AIMessage
 
 from tools import Context, get_weather, get_user_info, save_user_info
+
+
+class response:
+    """A lightweight, useful HTTP-like response object.
+
+    This class provides a concrete implementation for the operations typically needed by
+    higher-level code: reading the payload as text or JSON, checking status, and
+    exposing headers. The object is intentionally simple and dependency-free.
+    """
+
+    def __init__(
+        self,
+        body: Any = "",
+        *,
+        status_code: int = 200,
+        headers: dict[str, Any] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.body = body
+
+    @property
+    def status_code(self) -> int:
+        return self._status_code
+
+    @status_code.setter
+    def status_code(self, value: int) -> None:
+        self._status_code = int(value)
+
+    @property
+    def headers(self) -> dict[str, Any]:
+        return self._headers
+
+    @headers.setter
+    def headers(self, value: dict[str, Any] | None) -> None:
+        self._headers = {} if value is None else dict(value)
+
+    @property
+    def body(self) -> Any:
+        return self._body
+
+    @body.setter
+    def body(self, value: Any) -> None:
+        self._body = value
+
+    def text(self) -> str:
+        if self.body is None:
+            return ""
+        if isinstance(self.body, bytes):
+            return self.body.decode("utf-8", errors="replace")
+        return str(self.body)
+
+    def json(self) -> Any:
+        payload = self.body
+        if payload is None:
+            return None
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode("utf-8", errors="replace")
+        if isinstance(payload, str):
+            return json.loads(payload)
+        return payload
+
+    def ok(self) -> bool:
+        return 200 <= self.status_code < 300
+
+    def __bool__(self) -> bool:
+        return self.ok()
+
+    def __repr__(self) -> str:
+        return (
+            f"response(status_code={self.status_code}, "
+            f"headers={self.headers!r}, body={self.body!r})"
+        )
+
 
 # --- 一、模型与 .env 的加载顺序 ---------------------------------------------
 # 必须先 load_dotenv() 再构造 ChatOpenAI：ChatOpenAI **在构造时**就读取 LLM_MODEL_ID /
@@ -147,7 +108,6 @@ advanced_model = ChatOpenAI(
     api_key=os.getenv("LLM_API_KEY"),
     base_url=os.getenv("LLM_BASE_URL"),
 )
-
 
 # --- 二、长期记忆 Store -----------------------------------------------------
 def build_store() -> InMemoryStore:
@@ -286,17 +246,90 @@ def inspect_model_output(state: CallCountState, runtime: Runtime) -> dict | None
     # 一次**模型调用的结果。这也解释了请求 B 结束时为什么是 []（最后一轮不再需要工具）。
     return {"last_tool_names": [c["name"] for c in calls]}
 
+# ① 观察层：打印 + 真的调用模型
 @wrap_model_call
-def dynamic_model_selection(request: ModelRequest, handler) -> ModelResponse:
-    message_count = len(request.state["messages"])
+def observe_model_call(request: ModelRequest, handler) -> ModelResponse:
 
-    # 长对话切低费率模型
-    model = basic_model if message_count > 4 else advanced_model
+    # state 只读
+    print(f"[wrap] 消息数 = {len(request.state['messages'])}")
+    print(f"[wrap] system_message = {request.system_message}")
+    response = handler(request)
 
-    print(f"message_count: {message_count}")
-    print(f"model_name: {model.model_name}")
+    # <- 真正的网络请求
+    ai_msg = response.result[0]
+    print(f"[wrap] 下游响应的 tool_calls = {[tc['name'] for tc in (ai_msg.tool_calls or [])]}")
+    print(f"[wrap] response_metadata = {ai_msg.response_metadata}")
+    print(f"[wrap] usage_metadata = {ai_msg.usage_metadata}")
+    print(f"[wrap] message_id = {ai_msg.id}")
 
-    return handler(request.override(model=model))
+    return response
+
+
+# ② 短路层：命中就返回，handler 一次都不调
+@wrap_model_call
+def local_cache_shortcut(request: ModelRequest, handler) -> ModelResponse:
+    """
+    命中“本地缓存”关键词时，直接返回本地构造的响应。
+
+    关键点：
+    命中缓存后不执行 handler(request)。
+
+    在当前 middleware 注册顺序下，handler 的下游是：
+        provider_call_probe
+            -> 真实模型
+
+    因此这里不调用 handler，就会跳过：
+        provider_call_probe
+        真实模型
+        后续模型产生的 tool_calls
+    """
+    latest_content = str(request.messages[-1].content)
+
+    if "本地缓存" in latest_content:
+        print("[cache] 命中本地缓存，不调用下游 handler")
+
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="[来自本地缓存，未调用模型]",
+                    additional_kwargs={
+                        "response_metadata": "local_cache",
+                    },
+                )
+            ]
+        )
+
+    print("[cache] 未命中，继续调用下游 handler")
+    
+    return handler(request)
+
+# 仅用于本次单进程教学实验。
+# 它不是 Agent State，也不是生产环境中的监控方案。
+provider_call_count = {"value": 0}
+
+@wrap_model_call
+def provider_call_probe(request: ModelRequest, handler) -> ModelResponse:
+    """
+    真实模型调用探针。
+
+    这个 wrapper 被放在本地短路层的内侧。
+    只有 local_cache_shortcut 没有短路、继续调用 handler 时，
+    才会进入这里。
+
+    因此：
+    - 普通请求：会执行这个探针；
+    - 本地缓存命中：不会执行这个探针。
+    """
+    provider_call_count["value"] += 1
+
+    print(
+        "[provider_probe] 进入真实模型调用层, "
+        f"累计次数 = {provider_call_count['value']}"
+    )
+
+    # 这里的 handler 通常已经是最内层的真实模型调用。
+    response = handler(request)
+    return response
 
 # --- 五、组装 Agent ---------------------------------------------------------
 def build_agent(store: InMemoryStore):
@@ -323,7 +356,7 @@ def build_agent(store: InMemoryStore):
         # get_weather 用于触发工具循环；另外两个依赖 Store，保留是为了让这个 Agent 的
         # 骨架与 @dynamic_prompt 实验一致。
         tools=[get_weather, get_user_info, save_user_info],
-        middleware=[count_model_calls, inspect_model_output, dynamic_model_selection],
+        middleware=[count_model_calls, inspect_model_output, observe_model_call, local_cache_shortcut, provider_call_probe],
         system_prompt="You are a helpful assistant",
         context_schema=Context,
         # 在这里声明扩展后的 State。这一行和装饰器上的声明若都去掉，hook 返回的
@@ -331,7 +364,7 @@ def build_agent(store: InMemoryStore):
         state_schema=CallCountState,
         store=store,
     )
-
+    
 
 # --- 六、辅助函数 -----------------------------------------------------------
 def print_messages(result: dict) -> None:
@@ -418,7 +451,7 @@ def main() -> None:
                 },
                 {
                     "role": "user",
-                    "content": "请告诉我北京今天的天气。",
+                    "content": "请告诉我北京今天的天气，并本地缓存下来。",
                 }
             ]
         },

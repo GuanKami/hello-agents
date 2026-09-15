@@ -67,6 +67,7 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_state_context_demo.py                     # State -> Model Context
 ├── langgraph_middleware_dynamic_prompt_demo.py         # @dynamic_prompt
 ├── langgraph_middleware_hooks_demo.py                  # before_model / after_model（已验证）
+├── langgraph_middleware_wrap_model_call_demo.py        # wrap_model_call（短路已观察，重试未做）
 ├── .gitignore            # 版本控制排除规则，见 3.4 节
 ├── requirements.txt
 ├── short-memory.db       # 本地 SQLite 运行产物；当前无脚本写入，见 4.11 节
@@ -81,7 +82,7 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 └── .omo/                 # 本地工具配置或运行产物
 ```
 
-当前根目录没有正式测试目录、CI 配置、构建配置、部署配置或 README.md。不要凭空假设这些设施存在。
+当前根目录没有正式测试目录、CI 配置、构建配置、部署配置或统一应用入口。README.md 记录仓库定位、实验目录、运行方式和已确定但尚未实现的 RepoResearcher 方向。不要凭空假设这些设施存在。
 
 ### 3.2 本次清理记录
 
@@ -194,6 +195,8 @@ langchain-openai
 - `EMBEDDING_MODEL_ID`
 - `MODEL_PROVIDER`
 - `SERPAPI_API_KEY`
+- `BASIC_MODEL_ID`（`langgraph_middleware_hooks_demo.py` 的低费率模型，2026-09-10 新增）
+- `ADVANCED_MODEL_ID`（同上，高费率 / 默认模型）
 
 仓库已有根目录 `.gitignore`（2026-09-10 新增，内容与排除项见 3.4 节）。新增敏感配置或运行产物目录时，必须同步补充排除规则，并用 `git check-ignore -v <路径>` 验证生效。
 
@@ -327,14 +330,40 @@ def wrapped(_self, request, handler):
 
 ```text
 文件头十项 docstring（按 6.4.3 规范）
-CallCountState(AgentState)            <- 扩展 model_call_count / last_tool_names
-build_store()                         <- 依赖注入，便于将来换 SqliteStore
-count_model_calls   (@before_model)   <- 返回 {"model_call_count": n}
-inspect_model_output(@after_model)    <- 返回 {"last_tool_names": [...]}
-build_agent(store)                    <- 组装 create_agent
+basic_model / advanced_model           <- 由 BASIC_MODEL_ID / ADVANCED_MODEL_ID 构造
+CallCountState(AgentState)             <- 扩展 model_call_count / last_tool_names
+build_store()                          <- 依赖注入，便于将来换 SqliteStore
+count_model_calls    (@before_model)   <- 返回 {"model_call_count": n}
+inspect_model_output (@after_model)    <- 返回 {"last_tool_names": [...]}
+dynamic_model_selection(@wrap_model_call) <- 复现课程"预算控制"，按消息数换模型
+build_agent(store)                     <- 组装 create_agent（三个 middleware 全注册）
 print_messages() / print_state_summary()
-main()                                <- 真实模型运行，有 API 成本
+main()                                 <- 真实模型运行，有 API 成本
 ```
+
+**该文件现在承载两个概念**（2026-09-10 维护者加入第二个）：
+
+- 主概念：`before_model` / `after_model` 写 State。
+- 附带：复现课程 `3.middleware.ipynb` 第一章的 `@wrap_model_call`"预算控制"——读 `request.state["messages"]` 长度，超过阈值就 `request.override(model=basic_model)`。按 6.1"每个实验只引入一个主要新概念"，附带部分在文件头已明确标注"不是本实验的学习目标"。**文件名的语义已略窄于文件内容**，是否拆分由维护者决定。
+
+**已实测确认的层叠关系**：`wrap_model_call` 包裹器位于**模型节点内部**，图节点在外。运行时打印顺序实证为：
+
+```text
+[before_model] 第 1 次调用模型, 当前 State 消息数 = 5     <- 图节点，先执行
+message_count: 5                                          <- 包裹器，后执行
+model_name: nvidia/nemotron-3.5-lightning:free
+[after_model] 模型产出 tool_calls = ['get_user_info']     <- 图节点
+```
+
+由此得到一个**反直觉但重要**的推论：包裹器短路（不调用 `handler`）时，`before_model` **早已执行完毕**，所以 **`before_model` 的计数不能用作"模型是否真的被调用"的探针**。正确探针是响应自身的元数据——真实响应带 `response_metadata.model_name` / `usage_metadata`，而本地伪造的 `AIMessage(content=...)` 这两项为空（已做零成本本地实测：`response_metadata = {}`、`usage_metadata = None`、`id = None`）。
+
+**课程"预算控制"复现的验证结果**：`message_count = 1` 时用 `advanced_model`；`message_count = 5` 时切到 `basic_model`，与代码阈值 `> 4` 一致。一次验证三件事：
+
+1. `wrap_model_call` 里能**读** `request.state`（只读，**不能写**）。
+2. `request.override(model=...)` 能替换本次调用的模型。
+3. `handler(request)` 才真正发起调用；不调用 `handler` 就没有请求。
+
+**尚未覆盖**：`handler` 被调用 **0 次**（短路）与 **N 次**（重试）。
 
 说明：本实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此验证不是确定性的，每次运行都会产生真实的 LLM API 调用与费用，且结果受模型当时行为影响。文件内没有 `run_deterministic_selfcheck()` 之类的自检路径。
 
@@ -383,7 +412,7 @@ main()                                <- 真实模型运行，有 API 成本
 
 **必须记住的坑**：hook 返回的自定义 State 字段**必须**出现在合并后的 State schema 中，否则会被**静默丢弃且不报错**。已实测：未声明 `state_schema` 时返回 `{"model_call_count": 99}`，最终读出 `None`；声明后读出 `99`。
 
-**未覆盖的部分**：多个同类型 middleware 的组合顺序；`can_jump_to` 跳转；消息裁剪；`wrap_model_call` / `wrap_tool_call`。本实验刻意不使用假模型 / Mock，因此不存在"不联网、可重复"的确定性验证路径——每次验证都是一次真实模型运行。
+**未覆盖的部分**：多个同类型 middleware 的组合顺序；`can_jump_to` 跳转；消息裁剪；`wrap_model_call` 的**短路 / 重试**（"换模型"用法已覆盖，见上）；`wrap_tool_call`。本实验刻意不使用假模型 / Mock，因此不存在"不联网、可重复"的确定性验证路径——每次验证都是一次真实模型运行。
 
 ### 4.9 `langgraph_react.py`
 
@@ -448,6 +477,31 @@ SqliteStore
   -> user_id 或 namespace + key
 ```
 
+### 4.12 `langgraph_middleware_wrap_model_call_demo.py`
+
+这是 `wrap_model_call` 的独立学习实验，重点观察模型调用 wrapper 的嵌套关系，以及 wrapper 如何控制下游 `handler` 是否继续执行。
+
+当前文件包含：
+
+- `observe_model_call`：读取 `request.state`、`request.system_message`，并观察下游返回的工具调用和响应元数据。
+- `local_cache_shortcut`：当最新用户消息包含“本地缓存”时，直接构造 `ModelResponse`，不调用自己的下游 `handler`。
+- 与 `before_model` / `after_model` 的组合：用于观察 wrapper 位于模型节点内部，而 hook 是外部图节点。
+
+维护者已通过真实模型运行完成以下观察：
+
+```text
+普通请求：wrapper 继续调用下游，模型可以正常回答并参与 ReAct 工具循环。
+缓存请求：命中“本地缓存”后直接返回 [来自本地缓存，未调用模型]，没有工具调用和后续模型轮次。
+```
+
+这已经验证了本地短路的代码路径和返回结果，但当前还没有加入独立的最内层 provider-call probe，因此“真实模型 API 调用次数为 0”尚未由计数器自动证明。`model_call_count` 只能表示进入 `before_model` / 模型节点的次数，不能在短路场景下代表真实 API 请求次数。
+
+当前未完成：
+
+- `handler` 调用 N 次的有限重试。
+- 生产级请求缓存、缓存键、过期策略和并发控制。
+- 多个同类型 wrapper 组合顺序的系统性实验。
+
 ## 5. 学习进度和路线（Learning Roadmap）
 
 ### 5.1 已完成
@@ -468,6 +522,9 @@ SqliteStore
 - `save_user_info` 的增量字典合并：新 key 加入，相同 key 新值覆盖旧值。
 - Embedding 和 InMemoryStore 语义检索最小实验。
 - `InMemoryStore` 的进程生命周期限制。
+- **`SqliteStore` 持久化（课程 Notebook 形式，2026-09-10 维护者确认已完成）**：在 `dive-into-langgraph/6.context.ipynb` 第三节中，用 `sqlite3.connect("user-info.db", check_same_thread=False, isolation_level=None)` 建连接，交给 `SqliteStore(conn)` 作为 Store 后端，用 `store.put(("user_info",), key, value)` 预置资料，再在工具内用 `runtime.store.get(("user_info",), user_id)` 读取。已掌握"**Store 后端可替换、长期资料的生命周期由后端决定**"这一机制。
+
+  **确认程度必须据实表述**（纪律见 3.3 / 6.4.5），不要把它说成"根目录已实测"：本验收只到**课程 Notebook 形式**，根目录实验代码没有落地；本地工作区**不存在** `user-info.db`；且该 Notebook 自带执行输出的 SqliteStore 工具格（第 23 / 26 格）里模型**没有发起工具调用**，直接回答"系统中没有关于她的数据记录"，因此 Notebook 自身也没有留下一次成功的 SqliteStore 读取记录（其输出环境是课程作者的 macOS `/Users/luochang/...`）。当前确认程度是"**机制已学、代码已读**"，不是"本地留有可复现的跨进程读取证据"。
 
 **上下文工程（Context Engineering）阶段已完成的最小实验**：
 
@@ -478,7 +535,9 @@ SqliteStore
 **Middleware 阶段已完成的最小实验**：
 
 - **`before_model` / `after_model` 写入 State**（`langgraph_middleware_hooks_demo.py`）：已由**真实模型运行**实测确认两个 hook 被编译成真正的图节点、位于 ReAct 循环内部、返回的 dict 会合并进 State 且 invoke 返回后可读；触发次数等于模型调用次数。两个学习目标均已验证。机制细节见 4.8 与 5.5 节。
-- 仍未做：`wrap_model_call` / `wrap_tool_call`。
+- **课程 `3.middleware.ipynb` 第一章"预算控制"已复现**（同一个 `langgraph_middleware_hooks_demo.py`）：`@wrap_model_call` 读 `request.state["messages"]` 长度，超过阈值就 `request.override(model=...)` 切换低费率模型；已实测切换生效（代码阈值 `> 4`）。同时确认了"包裹器在模型节点内部、图节点在外"的层叠关系，以及"能读 State 但不能写 State"这一边界。
+- **`wrap_model_call` 短路**（`langgraph_middleware_wrap_model_call_demo.py`）：已通过真实运行命中“本地缓存”分支，直接返回本地 `ModelResponse`，没有工具调用和后续模型轮次；尚未加入独立 provider-call probe 来自动计数真实模型 API 请求。调用 N 次的重试仍未做。
+- **仍未做**：`wrap_tool_call` 完全未做。
 
 根据 `dive-into-langgraph` 课程，以下章节标记为已完成：
 
@@ -486,41 +545,43 @@ SqliteStore
 快速入门
 状态图
 记忆
+上下文
 ```
 
 后续不应重复堆叠同一种用户资料读写 Demo，而应转向跨组件设计和 Agent 工程能力。
 
-### 5.2 当前阶段与执行顺序偏离（重要）
+### 5.2 当前阶段与执行顺序
 
-**计划顺序**（5.3 节）与实际执行顺序存在偏离，如实记录如下：
+**计划顺序**（5.3 节）与实际执行顺序：
 
 ```text
 计划:  SqliteStore 持久化验收 -> Context Engineering -> Middleware
 实际:  Context Engineering（Runtime+Store / State / @dynamic_prompt）已完成
        -> Middleware（dynamic_prompt / before_model / after_model）已完成，并由真实模型运行实测通过
-       -> SqliteStore 持久化验收【被跳过，仍未执行】
+       -> SqliteStore 持久化验收【已完成，课程 Notebook 形式】
 ```
 
-**偏离事实（截至 2026 年 9 月 10 日）**：
+**SqliteStore 这一项的结论（2026-09-10 维护者确认，原"顺序偏离"记录作废）**：
 
-- SqliteStore 持久化验收**没有执行**。`langgraph_context_demo.py`、`langgraph_state_context_demo.py`、`langgraph_middleware_dynamic_prompt_demo.py`、`langgraph_middleware_hooks_demo.py` **全部仍在使用 `InMemoryStore`**，因此所有长期资料实验的数据都只在单个 Python 进程内有效，退出即丢失。
-- 这是**真实的顺序偏离，不是文档表述问题**。前几轮 Agent 直接进入了 Context Engineering，未先完成跨进程持久化验收。
+- 本节曾把"SqliteStore 持久化验收"记为**被跳过、待补做**的真实顺序偏离。维护者确认此项**早已以课程 Notebook 形式完成**（`dive-into-langgraph/6.context.ipynb` 第三节），因此该偏离记录**作废，不再作为欠账**；12.2 节的对应任务已关闭。
+- 也就是说学习顺序上**不存在"跳过前置任务"**：Context Engineering 与 Middleware 是正常推进顺序。
+- 根目录 `langgraph_context_demo.py`、`langgraph_state_context_demo.py`、`langgraph_middleware_dynamic_prompt_demo.py`、`langgraph_middleware_hooks_demo.py` **仍然全部使用 `InMemoryStore`**。这是**刻意保留，不是未完成**：这四个实验的观察目标是 hook 触发次数、State 写入、以及 Context → Model Context 的构造边界，Store 后端不是当轮的学习变量，换掉它只会引入与学习目标无关的噪声。
+- 将来若需要根目录级别的跨进程长期记忆（例如 HITL 恢复实验，或简历项目要真的记住用户资料），**四个实验都通过 `build_store()` 单点注入 Store**，改这一处即可，不需要重写实验。
+- 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
-**待决策**：SqliteStore 持久化验收应作为独立实验补做，还是在 Middleware 阶段告一段落后补做。补做本身不是新概念，只是把 Store 后端从 `InMemoryStore` 换成 `SqliteStore`，并验证"第一次运行保存、结束 Python、第二次运行用新 `thread_id` 与相同 `user_id` 仍能读取"。
-
-当前重点：进入 `wrap_model_call`（下一个 Middleware hook），或先补做 SqliteStore 持久化验收。
+当前重点：完成 `wrap_model_call` 的重试 / fallback 语义和 `wrap_tool_call`，随后进入 Human-in-the-loop。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
 ### 5.3 后续顺序
 
 ```text
-1. SqliteStore 持久化验收                              [未执行，被跳过，待补做]
+1. SqliteStore 持久化验收                              [已完成，课程 Notebook 形式；根目录实验刻意保留 InMemoryStore]
 2. Context Engineering                                 [已完成]
 3. Middleware                                          [进行中]
    -> dynamic_prompt                                   [已完成]
    -> before_model / after_model                       [已完成，真实模型实测通过]
-   -> wrap_model_call                                  [下一步，未开始]
+   -> wrap_model_call                                  [进行中：换模型与短路已验证；重试未做]
    -> wrap_tool_call                                   [未开始]
 4. Human-in-the-loop
    -> interrupt
@@ -534,7 +595,7 @@ SqliteStore
 10. Production Architecture 和 DeerFlow 源码阅读
 ```
 
-第 1 步被跳过的事实见 5.2 节。它是唯一的顺序偏离项，其余步骤保持原计划。
+第 1 步已完成（课程 Notebook 形式），见 5.1 / 5.2 节。当前**不存在未处理的顺序偏离项**，其余步骤保持原计划。
 
 Middleware 放在 Context Engineering 之后，因为中间件经常需要读取和修改 State、Runtime、Prompt、Model 或 Tool 行为。Human-in-the-loop 放在 Middleware 之后，因为中断和恢复依赖可靠的 checkpoint。
 
@@ -759,7 +820,9 @@ LLM API
 
 ## 9. 简历项目演进方向（Portfolio Evolution）
 
-当前仓库仍是多个学习实验的集合，尚未确定最终业务场景。最终项目不应只是许多互相独立的 Demo，而应逐步形成一个完整、可解释、可评估的 Agent 应用。
+当前仓库仍是多个学习实验的集合，最终业务场景已经初步确定为 RepoResearcher，但尚未进入实现阶段。最终项目不应只是许多互相独立的 Demo，而应逐步形成一个完整、可解释、可评估的 Agent 应用。
+
+RepoResearcher 的定位是面向代码仓库的研究与研发辅助 Agent：未来帮助开发者分析陌生仓库、定位功能入口、追踪调用链、执行受控验证并生成带源码证据的技术报告。当前只记录方向，不把它描述成已实现能力；在正式开发前继续完成 Middleware、Human-in-the-loop、MCP、RAG、Subgraph、并行、Multi-Agent、Evaluation 和 Observability 等基础。
 
 建议演进路径：
 
@@ -834,7 +897,7 @@ Store / SqliteStore
 ### 11.1 语法检查
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py
 ```
 
 ### 11.2 LangGraph Agent 实验
@@ -874,11 +937,17 @@ Store / SqliteStore
 
 - **`before_model` / `after_model` 实验已完成**（`langgraph_middleware_hooks_demo.py`）：hook 已真正写入 State，两个学习目标均已由**真实模型运行**实测通过（触发次数 = 模型调用次数；返回的 dict 合并进 State 且 invoke 返回后可读）。文件头已按 6.4.3 补齐十项 docstring，基类为 `AgentState` 的扩展 `CallCountState`。详见 4.8 节。
 - 该实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此每次验证都会产生真实 API 调用与费用，结果受模型当时行为影响，不是确定性的。文件内没有自检路径。
-- **下一步实验：`wrap_model_call`**。它已在 `@dynamic_prompt` 中被隐性使用过（见 4.7 节），因此重点是把已知机制显式化：`handler` 回调、`request.override`、重试 / 短路 / 降级。`before_model` / `after_model` 可作为它的观测抓手。
+- **`wrap_model_call` 已完成的部分**：课程的"换模型"用法（`request.override(model=...)`）、`request.state` 只读读取、`handler(request)` 才真正发起调用——均已随课程"预算控制"复现验证，见 4.8 / 5.1 节。
+- **`wrap_model_call` 的短路已完成初步验证**（`langgraph_middleware_wrap_model_call_demo.py`）：真实运行中通过消息命中“本地缓存”条件，直接得到 `[来自本地缓存，未调用模型]`，没有工具调用和后续模型轮次。当前仍缺少独立 provider-call probe，因此真实 API 调用次数尚未由程序计数器自动证明。
+- **下一步 Middleware 实验**：实现 `wrap_model_call` 的有限重试 / fallback，随后学习 `wrap_tool_call`。重试必须限定异常类型、次数和退避策略，不能对所有异常无限重试。
+  - **判据警告**：`before_model` 的计数**不能**用来证明"模型没被调用"——它在包裹器上游，短路时早已执行完（原因见 4.8 节）。正确判据是响应元数据：真实响应带 `response_metadata.model_name` / `usage_metadata`，本地伪造的 `AIMessage` 这两项为空。
 
-### 12.2 被跳过的前置任务（需补做）
+### 12.2 Store 持久化验收（已关闭）
 
-- **SqliteStore 持久化验收**：将结构化资料的 Store 后端从 `InMemoryStore` 迁移到 `SqliteStore`，完成跨 Python 重启测试（第一次运行保存 `user_3`，结束进程，第二次运行用新 `thread_id` 与相同 `user_id` 仍能读取）。当前 4 个 Context / Middleware 实验全部仍是 `InMemoryStore`，数据退出即丢失。见 5.2 节。
+- **SqliteStore 持久化验收已完成**（2026-09-10 维护者确认）：以课程 Notebook 形式完成，即 `dive-into-langgraph/6.context.ipynb` 第三节（`sqlite3.connect("user-info.db")` + `SqliteStore(conn)` + `runtime.store.get(...)`）。原记录的"被跳过、需补做"作废。见 5.1 / 5.2 节。
+- 根目录 `langgraph_context_demo.py`、`langgraph_state_context_demo.py`、`langgraph_middleware_dynamic_prompt_demo.py`、`langgraph_middleware_hooks_demo.py` **刻意保留 `InMemoryStore`**，不是未完成项；四个文件的 `build_store()` 都是 Store 的单点注入位置，将来需要跨进程持久化时只改这一处。
+- **确认程度（据实记录）**：本地工作区不存在 `user-info.db`，该 Notebook 自带的执行输出中也没有一次成功的 SqliteStore 读取。因此这一项的结论是"机制已学、代码已读"，不是"根目录已实测"。详见 5.1 节。
+- **仍然未验证的组合**：`SqliteStore` 与 `before_model` / `after_model` hook 一起工作（即 hook 能否读到跨进程持久化的长期资料）。这个组合从未做过；若将来需要，可作为独立小实验。
 
 ### 12.3 已知缺陷与清理
 
@@ -891,7 +960,7 @@ Store / SqliteStore
 ### 12.4 工程与文档基础设施
 
 - 将 `langgraph`、`pydantic` 等直接使用的依赖补充到 `requirements.txt`。
-- 新增根目录 `README.md`，记录实验顺序、架构图、运行前提和验证结果。
+- README.md 已创建，记录实验顺序、架构图、运行前提、真实进度和已确定但尚未实现的 RepoResearcher 方向。
 - 为 StateGraph 路由、工具权限、资料合并和 Store 隔离建立最小测试，避免每次验证都产生外部调用和费用（原则见 10.2 节）。当前仓库**尚未建立**任何此类测试；已有的 Context / Middleware 实验全部采用真实模型手动验证，不使用假模型 / Mock。
 
 ### 12.5 后续学习任务
