@@ -1,7 +1,6 @@
-import json
 import os
 
-from typing import Any, NotRequired
+from typing import NotRequired
 from dotenv import load_dotenv
 
 from langchain.agents import create_agent
@@ -12,79 +11,6 @@ from langgraph.runtime import Runtime
 from langchain.messages import AIMessage
 
 from tools import Context, get_weather, get_user_info, save_user_info
-
-
-class response:
-    """A lightweight, useful HTTP-like response object.
-
-    This class provides a concrete implementation for the operations typically needed by
-    higher-level code: reading the payload as text or JSON, checking status, and
-    exposing headers. The object is intentionally simple and dependency-free.
-    """
-
-    def __init__(
-        self,
-        body: Any = "",
-        *,
-        status_code: int = 200,
-        headers: dict[str, Any] | None = None,
-    ) -> None:
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.body = body
-
-    @property
-    def status_code(self) -> int:
-        return self._status_code
-
-    @status_code.setter
-    def status_code(self, value: int) -> None:
-        self._status_code = int(value)
-
-    @property
-    def headers(self) -> dict[str, Any]:
-        return self._headers
-
-    @headers.setter
-    def headers(self, value: dict[str, Any] | None) -> None:
-        self._headers = {} if value is None else dict(value)
-
-    @property
-    def body(self) -> Any:
-        return self._body
-
-    @body.setter
-    def body(self, value: Any) -> None:
-        self._body = value
-
-    def text(self) -> str:
-        if self.body is None:
-            return ""
-        if isinstance(self.body, bytes):
-            return self.body.decode("utf-8", errors="replace")
-        return str(self.body)
-
-    def json(self) -> Any:
-        payload = self.body
-        if payload is None:
-            return None
-        if isinstance(payload, (bytes, bytearray)):
-            payload = payload.decode("utf-8", errors="replace")
-        if isinstance(payload, str):
-            return json.loads(payload)
-        return payload
-
-    def ok(self) -> bool:
-        return 200 <= self.status_code < 300
-
-    def __bool__(self) -> bool:
-        return self.ok()
-
-    def __repr__(self) -> str:
-        return (
-            f"response(status_code={self.status_code}, "
-            f"headers={self.headers!r}, body={self.body!r})"
-        )
 
 
 # --- 一、模型与 .env 的加载顺序 ---------------------------------------------
