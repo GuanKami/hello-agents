@@ -68,7 +68,9 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_middleware_dynamic_prompt_demo.py         # @dynamic_prompt
 ├── langgraph_middleware_hooks_demo.py                  # before_model / after_model（已验证）
 ├── langgraph_middleware_wrap_model_call_demo.py        # wrap_model_call（短路已观察，重试未做）
-├── langgraph_middleware_wrap_tool_call_demo.py         # wrap_tool_call（观察与权限短路已验证）
+├── langgraph_middleware_wrap_tool_call_demo.py         # wrap_tool_call（工具观察实验，拆分后待复跑）
+├── langgraph_middleware_tool_guard_demo.py             # 工具权限校验与执行短路（拆分后待复跑）
+├── langgraph_middleware_tool_error_demo.py             # 工具异常转换实验（空占位，未实现）
 ├── .gitignore            # 版本控制排除规则，见 3.4 节
 ├── requirements.txt
 ├── short-memory.db       # 本地 SQLite 运行产物；当前无脚本写入，见 4.11 节
@@ -505,45 +507,36 @@ SqliteStore
 
 ### 4.13 `langgraph_middleware_wrap_tool_call_demo.py`
 
-这是 `wrap_tool_call` 的工具观察与权限短路实验，重点区分“模型生成工具调用意图”、
-“工具函数真正执行”和“工具被策略拦截”三个阶段。
+这是 `wrap_tool_call` 的工具调用观察实验，重点区分“模型生成工具调用意图”和
+“工具函数真正执行”两个阶段。工具权限控制已拆分到 4.14 节的独立实验。
 
 当前文件包含：
 
 - `observe_model_call`：辅助观察每轮模型输入消息数、工具调用和响应元数据。
 - `observe_tool_call`：接收 `ToolCallRequest`，读取工具名称、参数和 `tool_call_id`，
   在 `handler(request)` 前后打印工具执行过程。
-- `weather_permission_guard`：位于工具 wrapper 链外层，根据 `runtime.context.authority`
-  决定是否继续调用下游 `handler(request)`。
-- `build_agent()`：使用 `create_agent` 注册 `get_weather`，并组合模型观察 wrapper、
-  权限 wrapper 与工具观察 wrapper。
-- `build_store()`：使用 `InMemoryStore` 预置两个用户资料；当前 `get_weather` 不读取
-  Store，保留它是为了演示依赖注入位置和后续扩展边界。
+- `build_agent()`：使用 `create_agent` 注册 `get_weather`、`get_user_info` 和
+  `save_user_info`，并组合模型观察 wrapper 与工具观察 wrapper；不注册权限 guard。
+- `build_store()`：使用 `InMemoryStore` 预置两个用户资料，供用户资料工具精确读取和写入。
 
-维护者已于 **2026 年 9 月 16 日至 17 日**通过真实模型运行完成以下验证：
+拆分前的组合版本已于 **2026 年 9 月 16 日**通过真实模型运行完成基础观察验证：
 
 ```text
-请求 1（authority=admin）：模型生成 get_weather tool_call；权限检查放行，
-observe_tool_call 被触发，真实工具执行并返回 ToolMessage。
-请求 2（authority=user）：模型生成 get_weather tool_call；权限检查拒绝，
-直接返回权限错误 ToolMessage，不调用下游 handler，真实工具和内层
-observe_tool_call 都没有执行；Agent 继续读取 ToolMessage 并生成最终回答。
+请求 1（寒暄）：没有 tool_calls，observe_tool_call 未触发。
+请求 2（天气和用户资料）：模型分别提出天气和资料工具调用，
+每次实际工具调用都进入 observe_tool_call，并返回 ToolMessage。
 ```
 
-一次管理员请求的实际轨迹为：
+当前版本已移除权限 guard，并将请求 2 简化为“查询资料和天气”。拆分后的代码
+结构尚未重新进行真实模型复跑，因此上面的结果是本实验观察逻辑的历史验收记录，
+不是当前版本新的运行凭证。
+
+一次工具观察请求的实际轨迹为：
 
 ```text
-模型调用 1 -> get_weather tool_call -> permission_guard 放行
-            -> observe_tool_call -> get_weather -> ToolMessage
-模型调用 2 -> 最终自然语言回答
-```
-
-一次普通用户请求的实际轨迹为：
-
-```text
-模型调用 1 -> get_weather tool_call -> permission_guard 拒绝
-            -> 直接构造权限错误 ToolMessage
-模型调用 2 -> 最终自然语言回答
+模型调用 1 -> get_weather / get_user_info tool_call
+            -> observe_tool_call -> 真实工具 -> ToolMessage
+模型调用 2 -> 读取 ToolMessage -> 最终自然语言回答
 ```
 
 已确认：
@@ -551,25 +544,66 @@ observe_tool_call 都没有执行；Agent 继续读取 ToolMessage 并生成最�
 - `wrap_tool_call` 位于工具执行链内部，不是独立的 StateGraph 图节点。
 - `handler(request)` 之前可以读取模型生成的工具名称、参数和 `tool_call_id`，
   但这时只有工具调用意图，还不能说明工具函数已经执行。
-- `handler(request)` 表示继续下游工具执行链；放行路径最终会执行对应的工具函数，
-  并返回 `ToolMessage`。
-- 权限 wrapper 不调用 `handler(request)` 时，可以跳过内层 wrapper 和真实工具，
-  直接返回本地 `ToolMessage`；保留原 `tool_call_id` 能让 Agent 正确关联结果。
-- 工具结果（包括权限拒绝结果）会回到 Agent 消息 State，并被下一轮模型读取。
+- `handler(request)` 表示继续下游工具执行链；当前观察 wrapper 调用它后，
+  下游最终会执行对应的工具函数并返回 `ToolMessage`。
+- 工具结果会回到 Agent 消息 State，并被下一轮模型读取。
 
 当前未完成：
 
 - 工具异常转换：捕获 Python 异常并转换成模型可理解的 `ToolMessage`。
 - 工具重试、超时控制和 Human-in-the-loop 审批。
 - 多个同类型 `wrap_tool_call` wrapper 组合顺序的系统性实验。
+- 当前版本拆分后的真实模型复跑。
 
 当前限制：
 
 - 使用真实模型运行，工具是否被调用受模型决策影响并产生 API 成本。
-- `get_weather` 是固定返回文本的演示工具，不是真实天气服务。
+- `get_weather` 是固定返回文本的演示工具，不是真实天气服务；资料工具依赖 Store。
 - `InMemoryStore` 只在当前 Python 进程内有效。
-- 当前权限策略只演示 `get_weather` 的 `admin` / `user` 分支，尚未形成通用的
-  工具权限矩阵或生产级审计日志。
+
+### 4.14 `langgraph_middleware_tool_guard_demo.py`
+
+这是从工具观察实验中拆出的独立权限控制实验，重点学习工具执行前的权限闸门
+以及 `handler(request)` 的 0 次 / 1 次调用差异。
+
+当前文件包含：
+
+- `weather_permission_guard`：读取应用注入的 `runtime.context.authority`，
+  不信任模型工具参数中的权限声明。
+- `build_agent()`：只注册 `get_weather` 和权限 middleware，去掉 Store、用户资料
+  工具以及额外的观察 wrapper，降低实验噪声。
+- `main()`：使用完全相同的天气问题，分别以 `admin` 和 `user` 身份执行，
+  只改变 `Context.authority`。
+
+拆分前的组合版本已于 **2026 年 9 月 17 日**通过真实模型运行验证权限逻辑：
+
+```text
+authority=admin：模型生成 get_weather tool_call -> guard 放行
+                -> handler -> 真实 get_weather -> ToolMessage
+authority=user：模型生成 get_weather tool_call -> guard 拒绝
+                -> 不调用 handler -> 直接返回权限错误 ToolMessage
+```
+
+当前独立文件已经完成结构拆分，但拆分后的入口尚未重新进行真实模型运行；因此
+上面的记录证明的是相同 guard 逻辑的历史运行结果，不是独立文件的新运行凭证。
+
+已确认的机制：
+
+- 权限 wrapper 位于真实工具执行之前。
+- 不调用 `handler(request)` 可以跳过下游工具执行链。
+- 返回带原始 `tool_call_id` 的 `ToolMessage` 后，Agent 仍可继续下一轮模型处理。
+- 权限判断应使用应用注入的 Context，而不是模型自行生成的工具参数。
+
+当前未完成：
+
+- 独立文件拆分后的真实模型复跑。
+- 通用工具权限矩阵、角色继承和审计日志。
+- 工具异常转换、重试、超时和 Human-in-the-loop 审批。
+
+### 4.15 `langgraph_middleware_tool_error_demo.py`
+
+这是为后续工具异常转换实验预留的根目录文件，目前为空占位文件，尚未实现，
+也没有任何运行验证。不得因为文件存在就把“工具异常已处理”描述成已完成能力。
 
 ## 5. 学习进度和路线（Learning Roadmap）
 
@@ -606,7 +640,9 @@ observe_tool_call 都没有执行；Agent 继续读取 ToolMessage 并生成最�
 - **`before_model` / `after_model` 写入 State**（`langgraph_middleware_hooks_demo.py`）：已由**真实模型运行**实测确认两个 hook 被编译成真正的图节点、位于 ReAct 循环内部、返回的 dict 会合并进 State 且 invoke 返回后可读；触发次数等于模型调用次数。两个学习目标均已验证。机制细节见 4.8 与 5.5 节。
 - **课程 `3.middleware.ipynb` 第一章"预算控制"已复现**（同一个 `langgraph_middleware_hooks_demo.py`）：`@wrap_model_call` 读 `request.state["messages"]` 长度，超过阈值就 `request.override(model=...)` 切换低费率模型；已实测切换生效（代码阈值 `> 4`）。同时确认了"包裹器在模型节点内部、图节点在外"的层叠关系，以及"能读 State 但不能写 State"这一边界。
 - **`wrap_model_call` 短路**（`langgraph_middleware_wrap_model_call_demo.py`）：已通过真实运行命中“本地缓存”分支，直接返回本地 `ModelResponse`，没有工具调用和后续模型轮次；`provider_call_probe` 已验证普通请求计数为 1、缓存请求不进入探针。调用 N 次的重试仍未做。
-- **`wrap_tool_call` 工具观察与权限短路**（`langgraph_middleware_wrap_tool_call_demo.py`）：已由真实模型运行验证。`authority="admin"` 时，权限 wrapper 调用下游 handler，`observe_tool_call` 记录并放行真实 `get_weather`；`authority="user"` 时，权限 wrapper 不调用 handler，直接返回权限错误 `ToolMessage`，内层观察器和真实工具均被跳过，Agent 仍能继续生成最终回答。异常转换、重试、超时和审批仍未做。
+- **`wrap_tool_call` 工具调用观察**（`langgraph_middleware_wrap_tool_call_demo.py`）：拆分前已由真实模型运行验证工具调用前后观察、`handler(request)` 执行真实工具、`ToolMessage` 返回以及多个工具调用的独立触发。当前版本已移除权限 guard，改为独立观察实验；拆分后的入口尚未复跑。异常转换、重试、超时和审批仍未做。
+- **`tool_guard` 权限校验与执行短路**（`langgraph_middleware_tool_guard_demo.py`）：拆分前已由真实模型运行验证 `admin` 放行和 `user` 拒绝两条路径；当前独立文件已完成结构拆分，但尚未重新运行。通用权限矩阵、异常转换、重试、超时和审批仍未做。
+- **`tool_error` 工具异常转换**（`langgraph_middleware_tool_error_demo.py`）：当前仅为空占位文件，尚未实现。
 
 根据 `dive-into-langgraph` 课程，以下章节标记为已完成：
 
@@ -638,7 +674,9 @@ observe_tool_call 都没有执行；Agent 继续读取 ToolMessage 并生成最�
 - 将来若需要根目录级别的跨进程长期记忆（例如 HITL 恢复实验，或简历项目要真的记住用户资料），**四个实验都通过 `build_store()` 单点注入 Store**，改这一处即可，不需要重写实验。
 - 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
-当前重点：先完成 `wrap_tool_call` 的异常转换，再视实验粒度补充有限重试或超时控制；`wrap_model_call` 的重试 / fallback 暂缓，随后进入 Human-in-the-loop。
+当前重点：先分别运行拆分后的 `wrap_tool_call` 观察实验和 `tool_guard` 权限实验，
+确认行为与拆分前的真实运行记录一致；然后完成工具异常转换，再视实验粒度补充
+有限重试或超时控制。`wrap_model_call` 的重试 / fallback 暂缓，随后进入 Human-in-the-loop。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -651,7 +689,8 @@ observe_tool_call 都没有执行；Agent 继续读取 ToolMessage 并生成最�
    -> dynamic_prompt                                   [已完成]
    -> before_model / after_model                       [已完成，真实模型实测通过]
    -> wrap_model_call                                  [进行中：换模型与短路已验证；重试未做]
-   -> wrap_tool_call                                   [进行中：基础观察与权限短路已验证；异常 / 重试未做]
+   -> wrap_tool_call                                   [进行中：观察逻辑已拆分，拆分后待复跑；异常 / 重试未做]
+   -> tool_guard                                       [进行中：旧组合版本已验证，独立文件待复跑]
 4. Human-in-the-loop
    -> interrupt
    -> 审批
@@ -1008,7 +1047,7 @@ Store / SqliteStore
 - 该实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此每次验证都会产生真实 API 调用与费用，结果受模型当时行为影响，不是确定性的。文件内没有自检路径。
 - **`wrap_model_call` 已完成的部分**：课程的"换模型"用法（`request.override(model=...)`）、`request.state` 只读读取、`handler(request)` 才真正发起调用——均已随课程"预算控制"复现验证，见 4.8 / 5.1 节。
 - **`wrap_model_call` 的短路已完成初步验证**（`langgraph_middleware_wrap_model_call_demo.py`）：真实运行中通过消息命中“本地缓存”条件，直接得到 `[来自本地缓存，未调用模型]`，没有工具调用和后续模型轮次。随后加入 `provider_call_probe`，普通请求进入探针并计数为 1，缓存请求未进入探针；调用 N 次的重试仍未做。
-- **`wrap_tool_call` 基础观察与权限短路已完成**（`langgraph_middleware_wrap_tool_call_demo.py`）：真实运行中验证工具调用前后观察、`handler(request)` 执行工具、权限 wrapper 直接返回 `ToolMessage`、以及工具结果继续进入下一轮模型。`admin` 放行时会进入内层观察器和真实工具，`user` 拒绝时会跳过二者。下一步是工具异常转换，再考虑有限重试；重试必须限定异常类型、次数和退避策略，不能对所有异常无限重试。
+- **`wrap_tool_call` 工具观察与 `tool_guard` 权限控制已完成概念验证**：拆分前的真实运行已验证工具调用前后观察、`handler(request)` 执行工具、以及权限 wrapper 的放行 / 短路；当前两个独立文件已经完成结构拆分，但拆分后的入口仍待复跑。下一步是工具异常转换，再考虑有限重试；重试必须限定异常类型、次数和退避策略，不能对所有异常无限重试。
   - **判据警告**：`before_model` 的计数**不能**用来证明"模型没被调用"——它在包裹器上游，短路时早已执行完（原因见 4.8 节）。正确判据是响应元数据：真实响应带 `response_metadata.model_name` / `usage_metadata`，本地伪造的 `AIMessage` 这两项为空。
 
 ### 12.2 Store 持久化验收（已关闭）
