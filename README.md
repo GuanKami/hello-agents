@@ -6,7 +6,9 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 9 月 15 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering，以及部分 Middleware 实验。
+> 截至 2026 年 9 月 18 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的 approve/reject 最小路径。
+>
+> 当前下一步是使用 `SqliteSaver` 验证 Human-in-the-loop 的跨进程暂停、审批和恢复，然后进入 MCP、RAG、Subgraph、Multi-Agent 和评估工程。
 
 ## 项目目标
 
@@ -85,8 +87,19 @@ LLM API
 - 使用 `wrap_model_call` 观察模型请求与响应。
 - 在 ReAct 工具循环中观察 wrapper 的重复执行。
 - 本地短路：命中条件时直接返回 `ModelResponse`，不继续调用内层 `handler`。
+- 使用 `wrap_tool_call` 观察工具调用参数、`tool_call_id` 和 `ToolMessage`。
+- 工具权限 middleware：根据运行时 `Context` 决定放行或短路工具执行。
+- 工具异常 middleware：捕获 `ZeroDivisionError` 并转换为模型可读取的错误 `ToolMessage`。
 
-Middleware 的重试、`wrap_tool_call`、Human-in-the-loop、MCP、RAG、Subgraph、并行和 Multi-Agent 仍未完成，具体状态以 [AGENTS.md](AGENTS.md) 为准。
+### Human-in-the-loop
+
+- 使用 `HumanInTheLoopMiddleware` 在工具执行前产生 `__interrupt__`。
+- 使用 `InMemorySaver` 保存暂停时的 State 和恢复位置。
+- 使用同一个 `thread_id` 和 `Command(resume=...)` 恢复执行。
+- `approve` 路径已验证：工具执行并返回正常 `ToolMessage`。
+- `reject` 路径已验证：工具不执行，返回拒绝 `ToolMessage`，当前提示词下模型不会重试。
+
+当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的 `edit/respond`、持久化 checkpoint、MCP、RAG、Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
@@ -100,7 +113,11 @@ Middleware 的重试、`wrap_tool_call`、Human-in-the-loop、MCP、RAG、Subgra
 | [`langgraph_state_context_demo.py`](langgraph_state_context_demo.py) | State 驱动 Model Context | 已完成 |
 | [`langgraph_middleware_dynamic_prompt_demo.py`](langgraph_middleware_dynamic_prompt_demo.py) | `@dynamic_prompt` | 已完成 |
 | [`langgraph_middleware_hooks_demo.py`](langgraph_middleware_hooks_demo.py) | `before_model` / `after_model` 写入 State，并复现动态换模型 | 已完成真实模型验证 |
-| [`langgraph_middleware_wrap_model_call_demo.py`](langgraph_middleware_wrap_model_call_demo.py) | wrapper 观察、模型调用链和本地短路 | 进行中 |
+| [`langgraph_middleware_wrap_model_call_demo.py`](langgraph_middleware_wrap_model_call_demo.py) | wrapper 观察、模型调用链和本地短路 | 换模型与短路已验证，重试未做 |
+| [`langgraph_middleware_wrap_tool_call_demo.py`](langgraph_middleware_wrap_tool_call_demo.py) | 工具调用前后观察、`handler(request)` 和 `ToolMessage` | 已完成真实模型验证 |
+| [`langgraph_middleware_tool_guard_demo.py`](langgraph_middleware_tool_guard_demo.py) | 基于 `Context.authority` 的工具权限放行和短路 | 已完成真实模型验证 |
+| [`langgraph_middleware_tool_error_demo.py`](langgraph_middleware_tool_error_demo.py) | 捕获 `ZeroDivisionError` 并转换为错误 `ToolMessage` | 已完成真实模型验证 |
+| [`langgraph_human_in_the_loop_demo.py`](langgraph_human_in_the_loop_demo.py) | `interrupt`、审批、checkpoint 和 `Command(resume=...)` | approve/reject 已验证，持久化恢复未做 |
 
 根目录的 `dive-into-langgraph/` 是独立的课程源码仓库，必须保留；`.agents/skills/dive-into-langgraph/` 是本地学习 Skill，也必须保留。
 
@@ -110,19 +127,23 @@ Middleware 的重试、`wrap_tool_call`、Human-in-the-loop、MCP、RAG、Subgra
 
 ```text
 hello-agents/
-├── tools.py                                  # 共享工具
-├── langgraph_react.py                         # 高层 Agent API 实验
-├── langgraph_state_react.py                   # 显式 StateGraph ReAct
-├── embedding_test.py                          # Embedding / Store 实验
-├── langgraph_context_demo.py                 # Runtime + Store 上下文
-├── langgraph_state_context_demo.py           # State 上下文
-├── langgraph_middleware_dynamic_prompt_demo.py
-├── langgraph_middleware_hooks_demo.py
-├── langgraph_middleware_wrap_model_call_demo.py
-├── requirements.txt
-├── AGENTS.md
-├── .agents/                                   # 本地 Skill 配置
-└── dive-into-langgraph/                       # 课程资料，独立仓库
+├── tools.py                                      # 共享工具、Context 和用户资料读写
+├── langgraph_react.py                            # 高层 Agent API 实验
+├── langgraph_state_react.py                      # 显式 StateGraph ReAct
+├── embedding_test.py                             # Embedding / Store 语义检索
+├── langgraph_context_demo.py                    # Runtime + Store -> Model Context
+├── langgraph_state_context_demo.py              # State -> Model Context
+├── langgraph_middleware_dynamic_prompt_demo.py  # @dynamic_prompt
+├── langgraph_middleware_hooks_demo.py           # before_model / after_model
+├── langgraph_middleware_wrap_model_call_demo.py # wrap_model_call
+├── langgraph_middleware_wrap_tool_call_demo.py  # wrap_tool_call 观察
+├── langgraph_middleware_tool_guard_demo.py      # 工具权限闸门
+├── langgraph_middleware_tool_error_demo.py      # 工具异常转换
+├── langgraph_human_in_the_loop_demo.py          # Human-in-the-loop 审批
+├── requirements.txt                              # Python 依赖声明
+├── AGENTS.md                                    # 长期协作规范和真实进度
+├── .agents/                                     # 本地 Skill 配置
+└── dive-into-langgraph/                         # 课程资料，独立仓库
 ```
 
 当前根目录没有正式测试目录、CI 配置、构建配置、部署配置或统一应用入口。每个脚本主要服务于一个学习目标，不应仅为了减少文件数量而过早抽象。
@@ -162,11 +183,14 @@ ADVANCED_MODEL_ID
 
 ## 安装和运行
 
-仓库目前没有官方安装脚本、启动脚本、测试脚本或构建脚本。已有依赖可根据 `requirements.txt` 安装，具体实验使用虚拟环境中的 Python 逐个运行。
+仓库目前没有官方安装脚本、启动脚本、测试脚本或构建脚本。可以根据 `requirements.txt` 安装依赖，具体实验使用虚拟环境中的 Python 逐个运行。
 
 在 Windows PowerShell 中，当前常用入口如下：
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
 .\.venv\Scripts\python.exe langgraph_state_react.py
 .\.venv\Scripts\python.exe embedding_test.py
 .\.venv\Scripts\python.exe langgraph_context_demo.py
@@ -174,15 +198,23 @@ ADVANCED_MODEL_ID
 .\.venv\Scripts\python.exe langgraph_middleware_dynamic_prompt_demo.py
 .\.venv\Scripts\python.exe langgraph_middleware_hooks_demo.py
 .\.venv\Scripts\python.exe langgraph_middleware_wrap_model_call_demo.py
+.\.venv\Scripts\python.exe langgraph_middleware_wrap_tool_call_demo.py
+.\.venv\Scripts\python.exe langgraph_middleware_tool_guard_demo.py
+.\.venv\Scripts\python.exe langgraph_middleware_tool_error_demo.py
+.\.venv\Scripts\python.exe langgraph_human_in_the_loop_demo.py
 ```
 
 语法检查可以使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py
 ```
 
-这些实验中的模型和 Embedding 调用会访问外部 API，可能产生费用。没有测试框架时，脚本运行结果属于手动验证，不能等同于自动化测试。
+这些实验中的模型、Embedding 和搜索工具调用会访问外部 API，可能产生费用。运行前需要在根目录 `.env` 配置实际使用的接口参数；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
+
+没有测试框架时，脚本运行结果属于手动验证，不能等同于自动化测试。进行低成本静态检查时，优先使用 AST 解析或语法检查，不要为了导入模块而触发模块顶层的模型/Embedding 请求。
+
+部分实验使用 `InMemoryStore` 或 `InMemorySaver`，数据只在当前 Python 进程内有效；`thread_id` 只能在相同 checkpoint 后端仍可访问时恢复对应会话。当前仓库尚未把 Human-in-the-loop 改造成 `SqliteSaver` 跨进程恢复版本。
 
 ## 已确定的未来项目方向：RepoResearcher
 
@@ -225,9 +257,8 @@ ADVANCED_MODEL_ID
 
 ```text
 Middleware
-  -> wrap_model_call 重试 / fallback
-  -> wrap_tool_call
-  -> Human-in-the-loop
+  -> wrap_model_call 重试 / fallback（可选补充）
+  -> Human-in-the-loop 跨进程 checkpoint
   -> MCP Server
   -> RAG
   -> Subgraph / Parallel / Map-Reduce
