@@ -129,3 +129,8 @@ def save_user_info(user_info: UserInfo, runtime: ToolRuntime[Context]) -> str:
         )
 
     return "成功保存用户信息"
+
+@tool
+def divide(a: int, b: int) -> float:
+    """计算两个数字的商。"""
+    return a / b

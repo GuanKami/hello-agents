@@ -157,8 +157,18 @@ def main() -> None:
     # 这样实验变量只有权限，便于比较 handler 是否被调用。
     print("\n=== 请求 1：管理员查询天气（期望工具正常执行） ===")
     result01 = agent.invoke(
-        {"messages": [{"role": "user", "content": weather_question}]},
-        context=Context(user_id="user_1", authority="admin"),
+        {
+            "messages": [
+                {
+                    "role": "user", 
+                    "content": weather_question
+                }
+            ]
+        },
+        context=Context(
+            user_id="user_1", 
+            authority="admin"
+        ),
     )
     print_messages(result01)
 
@@ -166,8 +176,18 @@ def main() -> None:
 
     print("\n=== 请求 2：普通用户查询天气（期望工具被权限短路） ===")
     result02 = agent.invoke(
-        {"messages": [{"role": "user", "content": weather_question}]},
-        context=Context(user_id="user_2", authority="user"),
+        {
+            "messages": [
+                {
+                    "role": "user", 
+                    "content": weather_question
+                }
+            ]
+        },
+        context=Context(
+            user_id="user_2", 
+            authority="user"
+        ),
     )
     print_messages(result02)
 

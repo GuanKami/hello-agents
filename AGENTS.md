@@ -70,7 +70,7 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_middleware_wrap_model_call_demo.py        # wrap_model_call（短路已观察，重试未做）
 ├── langgraph_middleware_wrap_tool_call_demo.py         # wrap_tool_call（工具观察实验，拆分后待复跑）
 ├── langgraph_middleware_tool_guard_demo.py             # 工具权限校验与执行短路（拆分后待复跑）
-├── langgraph_middleware_tool_error_demo.py             # 工具异常转换实验（空占位，未实现）
+├── langgraph_middleware_tool_error_demo.py             # 工具异常转换实验（ZeroDivisionError 已验证）
 ├── .gitignore            # 版本控制排除规则，见 3.4 节
 ├── requirements.txt
 ├── short-memory.db       # 本地 SQLite 运行产物；当前无脚本写入，见 4.11 节
@@ -602,8 +602,47 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
 
 ### 4.15 `langgraph_middleware_tool_error_demo.py`
 
-这是为后续工具异常转换实验预留的根目录文件，目前为空占位文件，尚未实现，
-也没有任何运行验证。不得因为文件存在就把“工具异常已处理”描述成已完成能力。
+这是 `wrap_tool_call` 的工具异常转换实验，重点学习真实工具抛出 Python 异常后，
+如何由 middleware 将异常转换为模型可以继续读取的 `ToolMessage`。
+
+当前文件包含：
+
+- `handle_tool_error`：调用下游 `handler(request)` 执行工具；捕获
+  `ZeroDivisionError` 后，构造带原始 `tool_call_id` 的错误 `ToolMessage`。
+- `build_agent()`：注册 `divide` 工具和异常处理中间件，并通过系统提示词要求
+  所有除法请求都调用工具，包括除数为零的情况。
+- `main()`：分别验证正常除法和除零异常两条路径。
+
+维护者已于 **2026 年 9 月 18 日**通过真实模型运行完成以下验证：
+
+```text
+请求 1（10 / 2）：模型调用 divide -> 工具返回 5.0 -> ToolMessage -> 最终回答。
+请求 2（10 / 0）：模型调用 divide -> divide 抛出 ZeroDivisionError
+                -> handle_tool_error 捕获异常 -> 返回错误 ToolMessage
+                -> 下一轮模型读取错误并生成最终回答。
+```
+
+已确认：
+
+- 工具异常发生在 `handler(request)` 执行下游真实工具的过程中。
+- `wrap_tool_call` 可以捕获指定 Python 异常，而不是让 Agent 直接崩溃。
+- 异常可以被转换成 `ToolMessage`，并通过原始 `tool_call_id` 与模型的工具调用关联。
+- 错误 `ToolMessage` 会进入 Agent 消息 State，触发下一轮模型处理。
+- 工具注册并不等于模型必然调用工具；本次异常路径依赖更明确的系统提示词，
+  否则模型可能直接回答“除以零未定义”，使异常 middleware 根本不被触发。
+
+当前未完成：
+
+- 对 `ValueError`、`TimeoutError`、`ConnectionError` 等其他明确异常类型的分类处理。
+- 工具异常的有限重试、超时控制和 Human-in-the-loop 审批。
+- 将异常分类、错误码和用户可见消息抽象成生产级错误协议。
+
+当前限制：
+
+- 当前只对 `ZeroDivisionError` 做了专门转换，不代表所有工具异常都已处理。
+- 使用真实模型运行，工具调用决策会产生 API 成本；模型是否生成 tool_call 仍受提示词
+  和模型行为影响。
+- 当前返回的是教学用固定中文错误信息，尚未建立国际化、脱敏和统一审计策略。
 
 ## 5. 学习进度和路线（Learning Roadmap）
 
@@ -642,7 +681,7 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
 - **`wrap_model_call` 短路**（`langgraph_middleware_wrap_model_call_demo.py`）：已通过真实运行命中“本地缓存”分支，直接返回本地 `ModelResponse`，没有工具调用和后续模型轮次；`provider_call_probe` 已验证普通请求计数为 1、缓存请求不进入探针。调用 N 次的重试仍未做。
 - **`wrap_tool_call` 工具调用观察**（`langgraph_middleware_wrap_tool_call_demo.py`）：拆分前已由真实模型运行验证工具调用前后观察、`handler(request)` 执行真实工具、`ToolMessage` 返回以及多个工具调用的独立触发。当前版本已移除权限 guard，改为独立观察实验；拆分后的入口尚未复跑。异常转换、重试、超时和审批仍未做。
 - **`tool_guard` 权限校验与执行短路**（`langgraph_middleware_tool_guard_demo.py`）：拆分前已由真实模型运行验证 `admin` 放行和 `user` 拒绝两条路径；当前独立文件已完成结构拆分，但尚未重新运行。通用权限矩阵、异常转换、重试、超时和审批仍未做。
-- **`tool_error` 工具异常转换**（`langgraph_middleware_tool_error_demo.py`）：当前仅为空占位文件，尚未实现。
+- **`tool_error` 工具异常转换**（`langgraph_middleware_tool_error_demo.py`）：已由真实模型运行验证。正常路径中 `divide(10, 2)` 返回 `5.0`；异常路径中 `divide(10, 0)` 抛出 `ZeroDivisionError`，`handle_tool_error` 捕获后返回错误 `ToolMessage`，Agent 没有崩溃并继续生成最终回答。当前仅覆盖 `ZeroDivisionError`，其他异常、重试和超时仍未做。
 
 根据 `dive-into-langgraph` 课程，以下章节标记为已完成：
 
@@ -675,8 +714,9 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
 - 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
 当前重点：先分别运行拆分后的 `wrap_tool_call` 观察实验和 `tool_guard` 权限实验，
-确认行为与拆分前的真实运行记录一致；然后完成工具异常转换，再视实验粒度补充
-有限重试或超时控制。`wrap_model_call` 的重试 / fallback 暂缓，随后进入 Human-in-the-loop。
+确认行为与拆分前的真实运行记录一致；工具异常转换的最小实验已经完成，后续再视
+实验粒度补充有限重试或超时控制。`wrap_model_call` 的重试 / fallback 暂缓，随后
+进入 Human-in-the-loop。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -691,6 +731,7 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
    -> wrap_model_call                                  [进行中：换模型与短路已验证；重试未做]
    -> wrap_tool_call                                   [进行中：观察逻辑已拆分，拆分后待复跑；异常 / 重试未做]
    -> tool_guard                                       [进行中：旧组合版本已验证，独立文件待复跑]
+   -> tool_error                                       [已完成：ZeroDivisionError -> ToolMessage 已验证]
 4. Human-in-the-loop
    -> interrupt
    -> 审批
@@ -1005,7 +1046,7 @@ Store / SqliteStore
 ### 11.1 语法检查
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py
 ```
 
 ### 11.2 LangGraph Agent 实验
@@ -1047,7 +1088,8 @@ Store / SqliteStore
 - 该实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此每次验证都会产生真实 API 调用与费用，结果受模型当时行为影响，不是确定性的。文件内没有自检路径。
 - **`wrap_model_call` 已完成的部分**：课程的"换模型"用法（`request.override(model=...)`）、`request.state` 只读读取、`handler(request)` 才真正发起调用——均已随课程"预算控制"复现验证，见 4.8 / 5.1 节。
 - **`wrap_model_call` 的短路已完成初步验证**（`langgraph_middleware_wrap_model_call_demo.py`）：真实运行中通过消息命中“本地缓存”条件，直接得到 `[来自本地缓存，未调用模型]`，没有工具调用和后续模型轮次。随后加入 `provider_call_probe`，普通请求进入探针并计数为 1，缓存请求未进入探针；调用 N 次的重试仍未做。
-- **`wrap_tool_call` 工具观察与 `tool_guard` 权限控制已完成概念验证**：拆分前的真实运行已验证工具调用前后观察、`handler(request)` 执行工具、以及权限 wrapper 的放行 / 短路；当前两个独立文件已经完成结构拆分，但拆分后的入口仍待复跑。下一步是工具异常转换，再考虑有限重试；重试必须限定异常类型、次数和退避策略，不能对所有异常无限重试。
+- **`wrap_tool_call` 工具观察与 `tool_guard` 权限控制已完成概念验证**：拆分前的真实运行已验证工具调用前后观察、`handler(request)` 执行工具、以及权限 wrapper 的放行 / 短路；当前两个独立文件已经完成结构拆分，但拆分后的入口仍待复跑。
+- **`tool_error` 工具异常转换已完成最小实验**（`langgraph_middleware_tool_error_demo.py`）：真实运行中验证 `divide(10, 0)` 产生 `ZeroDivisionError`，middleware 将其转换为错误 `ToolMessage`，Agent 继续完成下一轮模型处理。下一步可扩展明确异常类型的分类处理，再考虑有限重试；重试必须限定异常类型、次数和退避策略，不能对所有异常无限重试。
   - **判据警告**：`before_model` 的计数**不能**用来证明"模型没被调用"——它在包裹器上游，短路时早已执行完（原因见 4.8 节）。正确判据是响应元数据：真实响应带 `response_metadata.model_name` / `usage_metadata`，本地伪造的 `AIMessage` 这两项为空。
 
 ### 12.2 Store 持久化验收（已关闭）
