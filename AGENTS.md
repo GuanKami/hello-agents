@@ -68,9 +68,10 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_middleware_dynamic_prompt_demo.py         # @dynamic_prompt
 ├── langgraph_middleware_hooks_demo.py                  # before_model / after_model（已验证）
 ├── langgraph_middleware_wrap_model_call_demo.py        # wrap_model_call（短路已观察，重试未做）
-├── langgraph_middleware_wrap_tool_call_demo.py         # wrap_tool_call（工具观察实验，拆分后待复跑）
-├── langgraph_middleware_tool_guard_demo.py             # 工具权限校验与执行短路（拆分后待复跑）
+├── langgraph_middleware_wrap_tool_call_demo.py         # wrap_tool_call（工具观察实验，已验证）
+├── langgraph_middleware_tool_guard_demo.py             # 工具权限校验与执行短路（已验证）
 ├── langgraph_middleware_tool_error_demo.py             # 工具异常转换实验（ZeroDivisionError 已验证）
+├── langgraph_human_in_the_loop_demo.py                 # Human-in-the-loop 审批（approve/reject 已验证）
 ├── .gitignore            # 版本控制排除规则，见 3.4 节
 ├── requirements.txt
 ├── short-memory.db       # 本地 SQLite 运行产物；当前无脚本写入，见 4.11 节
@@ -527,9 +528,9 @@ SqliteStore
 每次实际工具调用都进入 observe_tool_call，并返回 ToolMessage。
 ```
 
-当前版本已移除权限 guard，并将请求 2 简化为“查询资料和天气”。拆分后的代码
-结构尚未重新进行真实模型复跑，因此上面的结果是本实验观察逻辑的历史验收记录，
-不是当前版本新的运行凭证。
+当前版本已移除权限 guard，并将请求 2 简化为“查询资料和天气”。维护者已于
+**2026 年 9 月 18 日**重新运行当前独立文件并确认通过，因此上面的工具观察结论
+同时适用于拆分后的当前版本。
 
 一次工具观察请求的实际轨迹为：
 
@@ -550,10 +551,10 @@ SqliteStore
 
 当前未完成：
 
-- 工具异常转换：捕获 Python 异常并转换成模型可理解的 `ToolMessage`。
 - 工具重试、超时控制和 Human-in-the-loop 审批。
 - 多个同类型 `wrap_tool_call` wrapper 组合顺序的系统性实验。
-- 当前版本拆分后的真实模型复跑。
+
+工具异常转换已经拆分到 4.15 节的独立实验；本文件不重复实现该逻辑。
 
 当前限制：
 
@@ -584,8 +585,8 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
                 -> 不调用 handler -> 直接返回权限错误 ToolMessage
 ```
 
-当前独立文件已经完成结构拆分，但拆分后的入口尚未重新进行真实模型运行；因此
-上面的记录证明的是相同 guard 逻辑的历史运行结果，不是独立文件的新运行凭证。
+维护者已于 **2026 年 9 月 18 日**重新运行当前独立文件并确认通过。上面的两条
+权限路径现在都有独立文件的真实运行凭证，不再只是拆分前组合版本的历史记录。
 
 已确认的机制：
 
@@ -596,9 +597,8 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
 
 当前未完成：
 
-- 独立文件拆分后的真实模型复跑。
 - 通用工具权限矩阵、角色继承和审计日志。
-- 工具异常转换、重试、超时和 Human-in-the-loop 审批。
+- 重试、超时控制和 Human-in-the-loop 审批。
 
 ### 4.15 `langgraph_middleware_tool_error_demo.py`
 
@@ -644,6 +644,50 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
   和模型行为影响。
 - 当前返回的是教学用固定中文错误信息，尚未建立国际化、脱敏和统一审计策略。
 
+### 4.16 `langgraph_human_in_the_loop_demo.py`
+
+这是 Human-in-the-loop 工具审批实验，重点学习 Agent 在真正执行工具前暂停，
+由外部人工决定后再从 checkpoint 恢复执行。
+
+当前文件包含：
+
+- `HumanInTheLoopMiddleware(interrupt_on={"divide": True})`：在 `divide` 工具执行前
+  生成中断，不让工具直接运行。
+- `InMemorySaver`：保存当前 State、待审批的工具调用和恢复位置；它是短生命周期
+  的 checkpoint，不是长期用户资料 Store。
+- 第一次 `invoke`：模型提出 `divide` tool_call 后返回 `__interrupt__`，其中包含
+  `action_requests` 和 `review_configs`，供审批界面或外部系统展示。
+- 第二次 `invoke`：使用相同 `thread_id` 和 `Command(resume={"decisions": [...]})`
+  提交人工决定。
+
+维护者已通过真实模型运行验证两条基本路径：
+
+```text
+approve：模型生成 divide -> interrupt -> approve -> divide 执行 -> ToolMessage(6.0)
+         -> 下一轮模型生成最终回答。
+
+reject：模型生成 divide -> interrupt -> reject -> divide 不执行
+        -> ToolMessage 明确说明工具未执行 -> 模型生成未获批准的最终回答，未再次重试。
+```
+
+拒绝后恢复时再次看到原来的 AIMessage/tool_call 是正常的：Agent 正在恢复被
+checkpoint 暂停的待审批动作。真正判断工具是否执行，应观察后续 `ToolMessage`，而不是
+只看 AIMessage。`reject` 拒绝的是当前动作；如果系统提示词允许模型重试，模型仍可能
+提出新的 tool_call 并触发新的中断。本实验的系统提示词明确要求拒绝后不要重试。
+
+当前未完成：
+
+- 用 `SqliteSaver` 或 Postgres 等持久化 checkpoint 验证进程重启后的恢复。
+- 验证 `edit`、`respond` 等其他人工决定类型。
+- 审批身份、超时、审计日志、幂等和审批页面等生产能力。
+
+当前限制：
+
+- `InMemorySaver` 只在当前 Python 进程中有效；换进程或重启脚本后不能恢复这次中断。
+- 当前入口主要复现 `reject` 路径，`approve` 已有真实运行记录，但没有在同一次
+  `main()` 中同时执行两条分支。
+- 使用真实模型运行会产生 API 成本，工具调用是否出现受模型输出和系统提示词影响。
+
 ## 5. 学习进度和路线（Learning Roadmap）
 
 ### 5.1 已完成
@@ -679,9 +723,10 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
 - **`before_model` / `after_model` 写入 State**（`langgraph_middleware_hooks_demo.py`）：已由**真实模型运行**实测确认两个 hook 被编译成真正的图节点、位于 ReAct 循环内部、返回的 dict 会合并进 State 且 invoke 返回后可读；触发次数等于模型调用次数。两个学习目标均已验证。机制细节见 4.8 与 5.5 节。
 - **课程 `3.middleware.ipynb` 第一章"预算控制"已复现**（同一个 `langgraph_middleware_hooks_demo.py`）：`@wrap_model_call` 读 `request.state["messages"]` 长度，超过阈值就 `request.override(model=...)` 切换低费率模型；已实测切换生效（代码阈值 `> 4`）。同时确认了"包裹器在模型节点内部、图节点在外"的层叠关系，以及"能读 State 但不能写 State"这一边界。
 - **`wrap_model_call` 短路**（`langgraph_middleware_wrap_model_call_demo.py`）：已通过真实运行命中“本地缓存”分支，直接返回本地 `ModelResponse`，没有工具调用和后续模型轮次；`provider_call_probe` 已验证普通请求计数为 1、缓存请求不进入探针。调用 N 次的重试仍未做。
-- **`wrap_tool_call` 工具调用观察**（`langgraph_middleware_wrap_tool_call_demo.py`）：拆分前已由真实模型运行验证工具调用前后观察、`handler(request)` 执行真实工具、`ToolMessage` 返回以及多个工具调用的独立触发。当前版本已移除权限 guard，改为独立观察实验；拆分后的入口尚未复跑。异常转换、重试、超时和审批仍未做。
-- **`tool_guard` 权限校验与执行短路**（`langgraph_middleware_tool_guard_demo.py`）：拆分前已由真实模型运行验证 `admin` 放行和 `user` 拒绝两条路径；当前独立文件已完成结构拆分，但尚未重新运行。通用权限矩阵、异常转换、重试、超时和审批仍未做。
+- **`wrap_tool_call` 工具调用观察**（`langgraph_middleware_wrap_tool_call_demo.py`）：已由真实模型运行验证当前拆分文件中的工具调用前后观察、`handler(request)` 执行真实工具、`ToolMessage` 返回以及多个工具调用的独立触发。异常转换由 4.15 节独立实验负责；重试、超时和审批仍未做。
+- **`tool_guard` 权限校验与执行短路**（`langgraph_middleware_tool_guard_demo.py`）：已由真实模型运行验证当前拆分文件中的 `admin` 放行和 `user` 拒绝两条路径。通用权限矩阵、角色继承、审计日志、重试、超时和审批仍未做。
 - **`tool_error` 工具异常转换**（`langgraph_middleware_tool_error_demo.py`）：已由真实模型运行验证。正常路径中 `divide(10, 2)` 返回 `5.0`；异常路径中 `divide(10, 0)` 抛出 `ZeroDivisionError`，`handle_tool_error` 捕获后返回错误 `ToolMessage`，Agent 没有崩溃并继续生成最终回答。当前仅覆盖 `ZeroDivisionError`，其他异常、重试和超时仍未做。
+- **Human-in-the-loop 基础审批**（`langgraph_human_in_the_loop_demo.py`）：已由真实模型运行验证 `HumanInTheLoopMiddleware` 产生 `__interrupt__`、相同 `thread_id` 恢复，以及 `approve` 执行工具、`reject` 跳过工具并返回拒绝 `ToolMessage` 两条路径。当前 `InMemorySaver` 仅支持同一进程；`edit`、`respond` 和持久化 checkpoint 尚未验证。
 
 根据 `dive-into-langgraph` 课程，以下章节标记为已完成：
 
@@ -713,10 +758,10 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
 - 将来若需要根目录级别的跨进程长期记忆（例如 HITL 恢复实验，或简历项目要真的记住用户资料），**四个实验都通过 `build_store()` 单点注入 Store**，改这一处即可，不需要重写实验。
 - 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
-当前重点：先分别运行拆分后的 `wrap_tool_call` 观察实验和 `tool_guard` 权限实验，
-确认行为与拆分前的真实运行记录一致；工具异常转换的最小实验已经完成，后续再视
-实验粒度补充有限重试或超时控制。`wrap_model_call` 的重试 / fallback 暂缓，随后
-进入 Human-in-the-loop。
+当前重点：Middleware 的核心实验已经完成，包括模型 wrapper 短路、工具观察、权限
+短路和工具异常转换；Human-in-the-loop 的 `approve` / `reject` 最小路径也已经通过
+真实模型验证。可选补充 Middleware 的有限重试或超时控制，但不再阻塞主学习路线；
+下一步是用 `SqliteSaver` 验证跨进程的暂停、审批和恢复，再进入 MCP。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -729,13 +774,12 @@ authority=user：模型生成 get_weather tool_call -> guard 拒绝
    -> dynamic_prompt                                   [已完成]
    -> before_model / after_model                       [已完成，真实模型实测通过]
    -> wrap_model_call                                  [进行中：换模型与短路已验证；重试未做]
-   -> wrap_tool_call                                   [进行中：观察逻辑已拆分，拆分后待复跑；异常 / 重试未做]
-   -> tool_guard                                       [进行中：旧组合版本已验证，独立文件待复跑]
+   -> wrap_tool_call                                   [已完成：拆分后真实运行通过；重试 / 超时未做]
+   -> tool_guard                                       [已完成：拆分后真实运行通过；通用权限矩阵未做]
    -> tool_error                                       [已完成：ZeroDivisionError -> ToolMessage 已验证]
 4. Human-in-the-loop
-   -> interrupt
-   -> 审批
-   -> Command(resume=...)
+   -> interrupt / 审批 / Command(resume=...)                   [已完成：approve/reject]
+   -> SqliteSaver 跨进程暂停、审批和恢复                          [未完成]
 5. MCP Server 和外部工具协议
 6. RAG：加载、切分、索引、检索、引用
 7. Parallelization / Subgraph / Map-Reduce
@@ -1088,8 +1132,9 @@ Store / SqliteStore
 - 该实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此每次验证都会产生真实 API 调用与费用，结果受模型当时行为影响，不是确定性的。文件内没有自检路径。
 - **`wrap_model_call` 已完成的部分**：课程的"换模型"用法（`request.override(model=...)`）、`request.state` 只读读取、`handler(request)` 才真正发起调用——均已随课程"预算控制"复现验证，见 4.8 / 5.1 节。
 - **`wrap_model_call` 的短路已完成初步验证**（`langgraph_middleware_wrap_model_call_demo.py`）：真实运行中通过消息命中“本地缓存”条件，直接得到 `[来自本地缓存，未调用模型]`，没有工具调用和后续模型轮次。随后加入 `provider_call_probe`，普通请求进入探针并计数为 1，缓存请求未进入探针；调用 N 次的重试仍未做。
-- **`wrap_tool_call` 工具观察与 `tool_guard` 权限控制已完成概念验证**：拆分前的真实运行已验证工具调用前后观察、`handler(request)` 执行工具、以及权限 wrapper 的放行 / 短路；当前两个独立文件已经完成结构拆分，但拆分后的入口仍待复跑。
+- **`wrap_tool_call` 工具观察与 `tool_guard` 权限控制已完成**：维护者于 2026 年 9 月 18 日重新运行两个拆分后的独立文件，确认工具观察、`handler(request)` 执行工具、`admin` 放行和 `user` 短路路径均通过。重试、超时、通用权限矩阵和审批仍未做。
 - **`tool_error` 工具异常转换已完成最小实验**（`langgraph_middleware_tool_error_demo.py`）：真实运行中验证 `divide(10, 0)` 产生 `ZeroDivisionError`，middleware 将其转换为错误 `ToolMessage`，Agent 继续完成下一轮模型处理。下一步可扩展明确异常类型的分类处理，再考虑有限重试；重试必须限定异常类型、次数和退避策略，不能对所有异常无限重试。
+- **Human-in-the-loop 基础审批已完成**（`langgraph_human_in_the_loop_demo.py`）：2026 年 9 月 18 日真实运行验证了 `__interrupt__`、同一 `thread_id` 恢复、`approve` 执行工具和 `reject` 返回“工具未执行”的 `ToolMessage`，且当前提示词下拒绝后没有新的工具调用。`edit` / `respond`、持久化 checkpoint、审批身份、超时和审计仍未做。
   - **判据警告**：`before_model` 的计数**不能**用来证明"模型没被调用"——它在包裹器上游，短路时早已执行完（原因见 4.8 节）。正确判据是响应元数据：真实响应带 `response_metadata.model_name` / `usage_metadata`，本地伪造的 `AIMessage` 这两项为空。
 
 ### 12.2 Store 持久化验收（已关闭）
@@ -1115,7 +1160,8 @@ Store / SqliteStore
 
 ### 12.5 后续学习任务
 
-- 使用持久化 checkpoint 完成 Human-in-the-loop 的暂停、审批和恢复实验。
+- 使用 `SqliteSaver` 或其他持久化 checkpoint 完成 Human-in-the-loop 跨进程的暂停、审批和恢复实验。
+- 验证 Human-in-the-loop 的 `edit` / `respond` 决策，并补充审批身份、超时、审计和幂等设计。
 - 学习 MCP、RAG、Subgraph、并行和 Supervisor/Multi-Agent。
 - 选择最终简历项目的真实业务场景。
 - 建立评估数据、Trace、成本统计和失败分析机制。
