@@ -72,9 +72,11 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_middleware_tool_guard_demo.py             # 工具权限校验与执行短路（已验证）
 ├── langgraph_middleware_tool_error_demo.py             # 工具异常转换实验（ZeroDivisionError 已验证）
 ├── langgraph_human_in_the_loop_demo.py                 # Human-in-the-loop 审批（approve/reject 已验证）
+├── langgraph_human_in_the_loop_sqlite_demo.py          # SqliteSaver 跨进程 HITL（approve/reject 已验证）
 ├── .gitignore            # 版本控制排除规则，见 3.4 节
 ├── requirements.txt
 ├── short-memory.db       # 本地 SQLite 运行产物；当前无脚本写入，见 4.11 节
+├── hitl-checkpoint.db     # HITL SQLite checkpoint 运行产物；由 4.17 节脚本生成
 ├── skills-lock.json      # 本地 Skill 相关锁定信息
 ├── .env                  # 本地敏感配置，不应提交或打印
 ├── .agents/              # 本地 Agent/Skill 配置
@@ -459,15 +461,29 @@ START
 
 **注意 import 副作用**：该文件在第 36–42 行于**模块加载阶段**调用 `embeddings.embed_query(...)` 并打印维度。任何 `import langgraph_state_react` 都会立即产生一次外部 Embedding API 调用与费用。做零成本静态检查时不能导入该模块。
 
-### 4.11 `short-memory.db`
+### 4.11 SQLite 运行产物和 checkpoint 区分
 
-这是本地 SQLite 运行产物，当前大小约 741 KB，最后写入时间为 **2026 年 9 月 7 日 19:38**，早于后续所有 Context / Middleware 实验。
+根目录有两个用途不同的 SQLite 文件，不能因为它们都以 `.db` 结尾就混为一谈：
 
-**当前没有任何脚本在写入它**：全仓库的 `SqliteSaver` 只有 `langgraph_state_react.py` 第 86–87 行以注释形式存在，其余文件仅保留未使用的 import。因此：
+```text
+short-memory.db
+    -> 2026 年 9 月 7 日遗留的本地运行产物
+    -> 当前没有脚本写入
+    -> 不是当前 HITL 实验使用的数据库
 
-- 不要因为文件存在就推断 checkpoint 持久化"正在使用中"。
-- 不要把它当作长期用户资料数据库。
-- 它是孤立的历史遗留产物，是否清理需维护者明确授权。
+hitl-checkpoint.db
+    -> 由 langgraph_human_in_the_loop_sqlite_demo.py 生成
+    -> SqliteSaver 的 checkpoint 后端
+    -> 保存 Agent State、消息、待审批动作和恢复位置
+```
+
+`short-memory.db` 当前大小约 741 KB，最后写入时间为 **2026 年 9 月 7 日 19:38**，
+早于后续所有 Context / Middleware 实验。它是孤立的历史遗留产物，是否清理需维护者
+明确授权；不要把它当作长期用户资料数据库。
+
+`hitl-checkpoint.db` 已于 **2026 年 9 月 21 日**由 SQLite HITL 实验生成，保存了
+`test01` 和 `test02` 两条实验会话的 checkpoint。它同样不是用户长期资料数据库，且
+已被 `.gitignore` 的 `*.db` 规则排除，不应提交到 Git。
 
 不要把以下两者混为一谈：
 
@@ -688,6 +704,72 @@ checkpoint 暂停的待审批动作。真正判断工具是否执行，应观察
   `main()` 中同时执行两条分支。
 - 使用真实模型运行会产生 API 成本，工具调用是否出现受模型输出和系统提示词影响。
 
+### 4.17 `langgraph_human_in_the_loop_sqlite_demo.py`
+
+这是 4.16 的持久化版本，重点验证 `SqliteSaver` 能否在第一个 Python 进程结束后，
+让第二个 Python 进程继续恢复被 Human-in-the-loop 暂停的 Agent。
+
+当前文件包含：
+
+- `DB_PATH`：指向脚本所在目录的 `hitl-checkpoint.db`，避免两个进程因当前工作目录
+  不同而打开不同数据库。
+- `build_agent(checkpointer)`：接收外部传入的 `SqliteSaver`，保证 `start` 和
+  `resume` 使用相同的工具、middleware、系统提示词和图结构。
+- `start_agent(thread_id)`：提交原始用户消息，让模型生成 `divide` tool_call，
+  在工具真正执行前返回 `__interrupt__`，然后结束当前进程。
+- `resume_agent(thread_id, decision)`：重新打开 SQLite 文件，使用相同 `thread_id`
+  和 `Command(resume=...)` 恢复，不重新提交原始 `messages`。
+- `make_config()` / `make_context()`：分别构造 checkpoint 定位信息和每次运行都要
+  重新注入的运行时 `Context`。
+- `start` / `resume` 命令行模式：用两个独立 Python 进程模拟“产生中断”和“恢复审批”。
+
+运行方式：
+
+```powershell
+python langgraph_human_in_the_loop_sqlite_demo.py start test01
+python langgraph_human_in_the_loop_sqlite_demo.py resume test01 approve
+
+python langgraph_human_in_the_loop_sqlite_demo.py start test02
+python langgraph_human_in_the_loop_sqlite_demo.py resume test02 reject
+```
+
+维护者已于 **2026 年 9 月 21 日**通过真实模型运行验证两条跨进程路径：
+
+```text
+test01 / approve：
+进程 A 生成 divide -> interrupt -> SQLite 保存 checkpoint
+进程 B 使用同一 test01 恢复 -> divide 执行 -> ToolMessage(224.6)
+                 -> Agent 完成，没有新的中断。
+
+test02 / reject：
+进程 A 生成 divide -> interrupt -> SQLite 保存 checkpoint
+进程 B 使用同一 test02 恢复 -> divide 未执行
+                 -> 返回“工具未执行”的 ToolMessage
+                 -> Agent 生成未获批准的最终回答，没有新的中断。
+```
+
+两次恢复都保留了第一次生成的 `tool_call_id`，证明 `resume` 是从 SQLite checkpoint
+恢复待审批动作，而不是重新提交用户问题。`HumanMessage` 和原来的 `AIMessage/tool_call`
+在恢复输出中再次出现也是正常的恢复轨迹。
+
+必须区分：
+
+```text
+SqliteSaver
+    -> checkpoint / Agent State / 消息 / 暂停位置
+    -> thread_id
+
+SqliteStore
+    -> 用户资料和长期业务记忆
+    -> user_id 或 namespace + key
+```
+
+当前未完成：
+
+- 使用错误的 `thread_id` 做负向恢复验证。
+- `edit`、`respond` 决策。
+- Postgres 等远程 checkpoint、并发、审批身份、超时、审计、备份和幂等控制。
+
 ## 5. 学习进度和路线（Learning Roadmap）
 
 ### 5.1 已完成
@@ -726,7 +808,8 @@ checkpoint 暂停的待审批动作。真正判断工具是否执行，应观察
 - **`wrap_tool_call` 工具调用观察**（`langgraph_middleware_wrap_tool_call_demo.py`）：已由真实模型运行验证当前拆分文件中的工具调用前后观察、`handler(request)` 执行真实工具、`ToolMessage` 返回以及多个工具调用的独立触发。异常转换由 4.15 节独立实验负责；重试、超时和审批仍未做。
 - **`tool_guard` 权限校验与执行短路**（`langgraph_middleware_tool_guard_demo.py`）：已由真实模型运行验证当前拆分文件中的 `admin` 放行和 `user` 拒绝两条路径。通用权限矩阵、角色继承、审计日志、重试、超时和审批仍未做。
 - **`tool_error` 工具异常转换**（`langgraph_middleware_tool_error_demo.py`）：已由真实模型运行验证。正常路径中 `divide(10, 2)` 返回 `5.0`；异常路径中 `divide(10, 0)` 抛出 `ZeroDivisionError`，`handle_tool_error` 捕获后返回错误 `ToolMessage`，Agent 没有崩溃并继续生成最终回答。当前仅覆盖 `ZeroDivisionError`，其他异常、重试和超时仍未做。
-- **Human-in-the-loop 基础审批**（`langgraph_human_in_the_loop_demo.py`）：已由真实模型运行验证 `HumanInTheLoopMiddleware` 产生 `__interrupt__`、相同 `thread_id` 恢复，以及 `approve` 执行工具、`reject` 跳过工具并返回拒绝 `ToolMessage` 两条路径。当前 `InMemorySaver` 仅支持同一进程；`edit`、`respond` 和持久化 checkpoint 尚未验证。
+- **Human-in-the-loop 基础审批**（`langgraph_human_in_the_loop_demo.py`）：已由真实模型运行验证 `HumanInTheLoopMiddleware` 产生 `__interrupt__`、相同 `thread_id` 恢复，以及 `approve` 执行工具、`reject` 跳过工具并返回拒绝 `ToolMessage` 两条同进程路径。当前文件刻意保留 `InMemorySaver`，用于对照持久化版本。
+- **SqliteSaver 跨进程 Human-in-the-loop**（`langgraph_human_in_the_loop_sqlite_demo.py`）：已于 **2026 年 9 月 21 日**由真实模型运行验证。`test01` 在两个独立进程中完成 `approve`，工具返回 `224.6`；`test02` 在两个独立进程中完成 `reject`，工具未执行并返回拒绝 `ToolMessage`，两条路径均没有新的中断。错误 `thread_id`、`edit` / `respond` 和生产级审批能力尚未验证。
 
 根据 `dive-into-langgraph` 课程，以下章节标记为已完成：
 
@@ -759,9 +842,9 @@ checkpoint 暂停的待审批动作。真正判断工具是否执行，应观察
 - 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
 当前重点：Middleware 的核心实验已经完成，包括模型 wrapper 短路、工具观察、权限
-短路和工具异常转换；Human-in-the-loop 的 `approve` / `reject` 最小路径也已经通过
-真实模型验证。可选补充 Middleware 的有限重试或超时控制，但不再阻塞主学习路线；
-下一步是用 `SqliteSaver` 验证跨进程的暂停、审批和恢复，再进入 MCP。
+短路和工具异常转换；Human-in-the-loop 的同进程和 `SqliteSaver` 跨进程
+`approve` / `reject` 最小路径也已经通过真实模型验证。可选补充 Middleware 的有限
+重试或超时控制，但不再阻塞主学习路线；下一步进入 MCP。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -779,7 +862,7 @@ checkpoint 暂停的待审批动作。真正判断工具是否执行，应观察
    -> tool_error                                       [已完成：ZeroDivisionError -> ToolMessage 已验证]
 4. Human-in-the-loop
    -> interrupt / 审批 / Command(resume=...)                   [已完成：approve/reject]
-   -> SqliteSaver 跨进程暂停、审批和恢复                          [未完成]
+   -> SqliteSaver 跨进程暂停、审批和恢复                          [已完成：test01/test02]
 5. MCP Server 和外部工具协议
 6. RAG：加载、切分、索引、检索、引用
 7. Parallelization / Subgraph / Map-Reduce
@@ -1135,6 +1218,7 @@ Store / SqliteStore
 - **`wrap_tool_call` 工具观察与 `tool_guard` 权限控制已完成**：维护者于 2026 年 9 月 18 日重新运行两个拆分后的独立文件，确认工具观察、`handler(request)` 执行工具、`admin` 放行和 `user` 短路路径均通过。重试、超时、通用权限矩阵和审批仍未做。
 - **`tool_error` 工具异常转换已完成最小实验**（`langgraph_middleware_tool_error_demo.py`）：真实运行中验证 `divide(10, 0)` 产生 `ZeroDivisionError`，middleware 将其转换为错误 `ToolMessage`，Agent 继续完成下一轮模型处理。下一步可扩展明确异常类型的分类处理，再考虑有限重试；重试必须限定异常类型、次数和退避策略，不能对所有异常无限重试。
 - **Human-in-the-loop 基础审批已完成**（`langgraph_human_in_the_loop_demo.py`）：2026 年 9 月 18 日真实运行验证了 `__interrupt__`、同一 `thread_id` 恢复、`approve` 执行工具和 `reject` 返回“工具未执行”的 `ToolMessage`，且当前提示词下拒绝后没有新的工具调用。`edit` / `respond`、持久化 checkpoint、审批身份、超时和审计仍未做。
+- **SqliteSaver 跨进程 Human-in-the-loop 已完成**（`langgraph_human_in_the_loop_sqlite_demo.py`）：2026 年 9 月 21 日真实运行验证 `test01` 的 approve 和 `test02` 的 reject。两个独立 Python 进程使用同一个 `hitl-checkpoint.db` 和同一个 `thread_id` 恢复成功；approve 执行 `divide` 并返回 `224.6`，reject 返回工具未执行的 `ToolMessage`，两条路径均没有新的中断。错误 `thread_id`、`edit` / `respond`、审批身份、超时和审计仍未做。
   - **判据警告**：`before_model` 的计数**不能**用来证明"模型没被调用"——它在包裹器上游，短路时早已执行完（原因见 4.8 节）。正确判据是响应元数据：真实响应带 `response_metadata.model_name` / `usage_metadata`，本地伪造的 `AIMessage` 这两项为空。
 
 ### 12.2 Store 持久化验收（已关闭）
@@ -1160,7 +1244,7 @@ Store / SqliteStore
 
 ### 12.5 后续学习任务
 
-- 使用 `SqliteSaver` 或其他持久化 checkpoint 完成 Human-in-the-loop 跨进程的暂停、审批和恢复实验。
+- 使用错误 `thread_id` 完成 Human-in-the-loop 的跨会话负向恢复验证。
 - 验证 Human-in-the-loop 的 `edit` / `respond` 决策，并补充审批身份、超时、审计和幂等设计。
 - 学习 MCP、RAG、Subgraph、并行和 Supervisor/Multi-Agent。
 - 选择最终简历项目的真实业务场景。

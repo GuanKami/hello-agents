@@ -6,9 +6,9 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 9 月 18 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的 approve/reject 最小路径。
+> 截至 2026 年 9 月 21 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。
 >
-> 当前下一步是使用 `SqliteSaver` 验证 Human-in-the-loop 的跨进程暂停、审批和恢复，然后进入 MCP、RAG、Subgraph、Multi-Agent 和评估工程。
+> 当前下一步是补充 HITL 的负向 thread_id 验证和可选的 edit/respond，然后进入 MCP、RAG、Subgraph、Multi-Agent 和评估工程。
 
 ## 项目目标
 
@@ -98,8 +98,11 @@ LLM API
 - 使用同一个 `thread_id` 和 `Command(resume=...)` 恢复执行。
 - `approve` 路径已验证：工具执行并返回正常 `ToolMessage`。
 - `reject` 路径已验证：工具不执行，返回拒绝 `ToolMessage`，当前提示词下模型不会重试。
+- 使用 `SqliteSaver` 将 checkpoint 保存到 `hitl-checkpoint.db`。
+- 使用 `start` / `resume` 两种命令，在两个独立 Python 进程中完成暂停和恢复。
+- `test01` 的 approve 跨进程恢复和 `test02` 的 reject 跨进程恢复均已验证。
 
-当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的 `edit/respond`、持久化 checkpoint、MCP、RAG、Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时、审计、MCP、RAG、Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
@@ -118,6 +121,7 @@ LLM API
 | [`langgraph_middleware_tool_guard_demo.py`](langgraph_middleware_tool_guard_demo.py) | 基于 `Context.authority` 的工具权限放行和短路 | 已完成真实模型验证 |
 | [`langgraph_middleware_tool_error_demo.py`](langgraph_middleware_tool_error_demo.py) | 捕获 `ZeroDivisionError` 并转换为错误 `ToolMessage` | 已完成真实模型验证 |
 | [`langgraph_human_in_the_loop_demo.py`](langgraph_human_in_the_loop_demo.py) | `interrupt`、审批、checkpoint 和 `Command(resume=...)` | approve/reject 已验证，持久化恢复未做 |
+| [`langgraph_human_in_the_loop_sqlite_demo.py`](langgraph_human_in_the_loop_sqlite_demo.py) | `SqliteSaver`、`start/resume` 和跨进程 checkpoint 恢复 | approve/reject 已验证，负向 thread_id/edit/respond 未做 |
 
 根目录的 `dive-into-langgraph/` 是独立的课程源码仓库，必须保留；`.agents/skills/dive-into-langgraph/` 是本地学习 Skill，也必须保留。
 
@@ -140,8 +144,10 @@ hello-agents/
 ├── langgraph_middleware_tool_guard_demo.py      # 工具权限闸门
 ├── langgraph_middleware_tool_error_demo.py      # 工具异常转换
 ├── langgraph_human_in_the_loop_demo.py          # Human-in-the-loop 审批
+├── langgraph_human_in_the_loop_sqlite_demo.py   # SqliteSaver 跨进程 HITL
 ├── requirements.txt                              # Python 依赖声明
 ├── AGENTS.md                                    # 长期协作规范和真实进度
+├── hitl-checkpoint.db                            # SQLite checkpoint 运行产物，已被忽略
 ├── .agents/                                     # 本地 Skill 配置
 └── dive-into-langgraph/                         # 课程资料，独立仓库
 ```
@@ -202,19 +208,26 @@ python -m venv .venv
 .\.venv\Scripts\python.exe langgraph_middleware_tool_guard_demo.py
 .\.venv\Scripts\python.exe langgraph_middleware_tool_error_demo.py
 .\.venv\Scripts\python.exe langgraph_human_in_the_loop_demo.py
+
+# SQLite HITL：第一次命令创建中断，第二次命令在新的进程中恢复
+.\.venv\Scripts\python.exe langgraph_human_in_the_loop_sqlite_demo.py start test01
+.\.venv\Scripts\python.exe langgraph_human_in_the_loop_sqlite_demo.py resume test01 approve
 ```
 
 语法检查可以使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py
 ```
 
 这些实验中的模型、Embedding 和搜索工具调用会访问外部 API，可能产生费用。运行前需要在根目录 `.env` 配置实际使用的接口参数；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
 
 没有测试框架时，脚本运行结果属于手动验证，不能等同于自动化测试。进行低成本静态检查时，优先使用 AST 解析或语法检查，不要为了导入模块而触发模块顶层的模型/Embedding 请求。
 
-部分实验使用 `InMemoryStore` 或 `InMemorySaver`，数据只在当前 Python 进程内有效；`thread_id` 只能在相同 checkpoint 后端仍可访问时恢复对应会话。当前仓库尚未把 Human-in-the-loop 改造成 `SqliteSaver` 跨进程恢复版本。
+部分实验使用 `InMemoryStore` 或 `InMemorySaver`，数据只在当前 Python 进程内有效；
+`thread_id` 只能在相同 checkpoint 后端仍可访问时恢复对应会话。SQLite HITL 实验使用
+`SqliteSaver` 将 checkpoint 写入根目录的 `hitl-checkpoint.db`，该文件是运行产物，
+不是长期用户资料，也不会提交到 Git。
 
 ## 已确定的未来项目方向：RepoResearcher
 
@@ -258,7 +271,7 @@ python -m venv .venv
 ```text
 Middleware
   -> wrap_model_call 重试 / fallback（可选补充）
-  -> Human-in-the-loop 跨进程 checkpoint
+  -> Human-in-the-loop edit/respond 与负向 thread_id 验证（可选补充）
   -> MCP Server
   -> RAG
   -> Subgraph / Parallel / Map-Reduce
