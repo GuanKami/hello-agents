@@ -1,6 +1,59 @@
-openai
-python-dotenv
-google-search-results
-ipython
-langchain>=1.0
-langchain-openai
+# 当前实验运行依赖
+#
+# 这些包已经被根目录脚本直接使用，或者是当前 MCP / LangGraph 实验的运行时依赖。
+openai>=2.0
+python-dotenv>=1.2.2
+google-search-results>=2.4.2
+ipython>=9.0
+pydantic>=2.13
+langchain>=1.3.11
+langchain-openai>=1.3.3
+langgraph>=1.2.6
+langgraph-checkpoint-sqlite>=3.1.0
+
+# MCP 实验依赖
+#
+# fastmcp 用于创建 MCP Server；
+# langchain-mcp-adapters 将 MCP Server 暴露的工具适配为 LangChain Agent 工具。
+fastmcp>=3.4.2
+langchain-mcp-adapters>=0.3.0
+httpx>=0.27
+
+# 课程后续章节依赖
+#
+# 这些包服务于即将学习的 RAG、网络搜索、Supervisor、LangGraph CLI 和
+# Deep Agents，目前不一定被根目录的每一个脚本使用。
+langchain-community>=0.4.2
+langchain-text-splitters>=1.1.2
+rank-bm25>=0.2.2
+beautifulsoup4>=4.12
+scikit-learn>=1.9.0
+jieba>=0.42.1
+tavily-python>=0.7.26
+ddgs>=9.14.4
+langgraph-supervisor>=0.0.31
+
+# 后续可选能力（按需取消注释）
+#
+# 下面这些依赖不是当前 MCP / RAG / Supervisor 实验的必需项，分别对应
+# 异步 checkpoint、Redis checkpoint、LangMem、Deep Agents、DashScope 示例、
+# MCP 进程管理和 LangGraph 本地服务。真正开始对应实验时再安装。
+# aiosqlite>=0.20
+# langgraph-checkpoint-redis>=0.4.1
+# langmem>=0.0.30
+# deepagents>=0.6.11
+# dashscope>=1.25.24
+# supervisor>=4.3.0
+# langgraph-cli[inmem]>=0.4.30
+
+# 后续可选观测与供应商依赖
+# langsmith>=0.10
+
+# 本地开发辅助依赖（按需取消注释）
+#
+# Notebook、自动化测试和代码质量检查目前还没有成为根仓库的统一流程，
+# 但后续整理工程和评估实验时会用到。
+# jupyter>=1.0
+# ipykernel>=6.29
+# pytest>=8.0
+# ruff>=0.16

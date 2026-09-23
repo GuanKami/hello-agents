@@ -6,9 +6,9 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 9 月 21 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。
+> 截至 2026 年 9 月 23 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已接入独立 FastMCP Server，服务端代码已改为请求真实天气 API。
 >
-> 当前下一步是补充 HITL 的负向 thread_id 验证和可选的 edit/respond，然后进入 MCP、RAG、Subgraph、Multi-Agent 和评估工程。
+> 当前先用更新后的 MCP Agent 确认真实天气 API 返回，再进入 RAG。此前输出里的 `It's always sunny ...` 来自固定天气示例，只能证明旧版 MCP 工具链可运行，不代表真实天气接口验证通过。
 
 ## 项目目标
 
@@ -102,7 +102,15 @@ LLM API
 - 使用 `start` / `resume` 两种命令，在两个独立 Python 进程中完成暂停和恢复。
 - `test01` 的 approve 跨进程恢复和 `test02` 的 reject 跨进程恢复均已验证。
 
-当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时、审计、MCP、RAG、Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+### MCP 与真实天气服务
+
+- `langgraph_mcp_demo.py` 使用 `MultiServerMCPClient` 以 stdio 启动独立 MCP Server，并通过 `get_tools()` 发现工具，再交给 `create_agent`。
+- `mcp_server/get_weather_mcp/server.py` 使用 FastMCP 暴露 `get_weather`，并通过 HTTP 调用和风天气服务：先把中国城市名解析为经纬度，再请求当前天气。
+- 共享模块 [`tools.py`](tools.py) 中仍保留一个固定文本的 `get_weather` 教学工具；本实验不会直接导入它，而是使用 MCP Server 发现到的真实天气工具。
+- 已有旧版本输出验证了工具发现、模型生成 `tool_call`、工具结果返回和 Agent 继续回答的流程；其中固定的“始终晴朗”内容不属于实时天气结果。
+- 当前代码已经接入真实天气 HTTP API；本次文档更新没有重新发起真实天气或 LLM 请求，因此新的实时天气返回仍需本地运行确认。服务端还假设湿度字段是 0–1 的比例，需核对供应商实际 Schema 后再确认转换结果。
+
+当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时、审计、真实天气 API 的新版运行确认、RAG、Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
@@ -122,6 +130,8 @@ LLM API
 | [`langgraph_middleware_tool_error_demo.py`](langgraph_middleware_tool_error_demo.py) | 捕获 `ZeroDivisionError` 并转换为错误 `ToolMessage` | 已完成真实模型验证 |
 | [`langgraph_human_in_the_loop_demo.py`](langgraph_human_in_the_loop_demo.py) | `interrupt`、审批、checkpoint 和 `Command(resume=...)` | approve/reject 已验证，持久化恢复未做 |
 | [`langgraph_human_in_the_loop_sqlite_demo.py`](langgraph_human_in_the_loop_sqlite_demo.py) | `SqliteSaver`、`start/resume` 和跨进程 checkpoint 恢复 | approve/reject 已验证，负向 thread_id/edit/respond 未做 |
+| [`langgraph_mcp_demo.py`](langgraph_mcp_demo.py) | MCP stdio Client、工具发现与 Agent 工具循环 | 旧固定天气链路已运行；新真实天气 API 路径待运行确认 |
+| [`mcp_server/get_weather_mcp/server.py`](mcp_server/get_weather_mcp/server.py) | FastMCP 天气 Server，通过 HTTP 查询真实天气 | 已接入和风天气 API；本次未调用外部接口 |
 
 根目录的 `dive-into-langgraph/` 是独立的课程源码仓库，必须保留；`.agents/skills/dive-into-langgraph/` 是本地学习 Skill，也必须保留。
 
@@ -145,6 +155,9 @@ hello-agents/
 ├── langgraph_middleware_tool_error_demo.py      # 工具异常转换
 ├── langgraph_human_in_the_loop_demo.py          # Human-in-the-loop 审批
 ├── langgraph_human_in_the_loop_sqlite_demo.py   # SqliteSaver 跨进程 HITL
+├── langgraph_mcp_demo.py                        # MCP Client + Agent
+├── mcp_server/
+│   └── get_weather_mcp/server.py                # FastMCP + 真实天气 API
 ├── requirements.txt                              # Python 依赖声明
 ├── AGENTS.md                                    # 长期协作规范和真实进度
 ├── hitl-checkpoint.db                            # SQLite checkpoint 运行产物，已被忽略
@@ -162,11 +175,15 @@ hello-agents/
 - LangGraph
 - Pydantic
 - python-dotenv
+- FastMCP
+- langchain-mcp-adapters
+- httpx
+- 和风天气 HTTP API（运行时外部服务）
 - OpenAI 兼容接口
 - SerpApi（共享搜索工具使用）
 - IPython（消息展示和 Notebook 支持）
 
-根目录 `requirements.txt` 是当前明确声明的依赖列表。`langgraph` 和 `pydantic` 已被代码直接使用，但目前还没有在该文件中作为直接依赖单独声明；这属于后续工程整理事项。
+根目录 `requirements.txt` 是当前明确声明的依赖列表，包含 LangChain、LangGraph、Pydantic、FastMCP、`langchain-mcp-adapters` 和 `httpx` 等当前实验依赖。和风天气是运行时外部服务，不是可通过 pip 安装的包。
 
 ## 环境配置
 
@@ -183,8 +200,11 @@ MODEL_PROVIDER
 SERPAPI_API_KEY
 BASIC_MODEL_ID
 ADVANCED_MODEL_ID
+QWEATHER_API_HOST
+QWEATHER_API_KEY
 ```
 
+`QWEATHER_API_HOST` 填天气服务的 Host（不要包含密钥）；当前服务端会自行补上 `https://`。
 具体模型、接口地址和密钥由本地环境决定，README 不记录真实配置。
 
 ## 安装和运行
@@ -208,6 +228,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe langgraph_middleware_tool_guard_demo.py
 .\.venv\Scripts\python.exe langgraph_middleware_tool_error_demo.py
 .\.venv\Scripts\python.exe langgraph_human_in_the_loop_demo.py
+.\.venv\Scripts\python.exe langgraph_mcp_demo.py
 
 # SQLite HITL：第一次命令创建中断，第二次命令在新的进程中恢复
 .\.venv\Scripts\python.exe langgraph_human_in_the_loop_sqlite_demo.py start test01
@@ -217,10 +238,10 @@ python -m venv .venv
 语法检查可以使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
-这些实验中的模型、Embedding 和搜索工具调用会访问外部 API，可能产生费用。运行前需要在根目录 `.env` 配置实际使用的接口参数；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
+MCP 命令会启动本地 stdio Server，并请求真实天气 API 和 LLM；可能产生外部请求或费用。运行前需要在根目录 `.env` 配置 `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`QWEATHER_API_HOST` 和 `QWEATHER_API_KEY`。模型、Embedding、搜索和天气工具都可能访问外部 API；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
 
 没有测试框架时，脚本运行结果属于手动验证，不能等同于自动化测试。进行低成本静态检查时，优先使用 AST 解析或语法检查，不要为了导入模块而触发模块顶层的模型/Embedding 请求。
 
@@ -272,7 +293,7 @@ python -m venv .venv
 Middleware
   -> wrap_model_call 重试 / fallback（可选补充）
   -> Human-in-the-loop edit/respond 与负向 thread_id 验证（可选补充）
-  -> MCP Server
+  -> MCP 天气 Agent（stdio Client/Server 已接通；真实天气返回待确认）
   -> RAG
   -> Subgraph / Parallel / Map-Reduce
   -> Supervisor / Multi-Agent

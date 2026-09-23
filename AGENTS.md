@@ -73,6 +73,9 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_middleware_tool_error_demo.py             # 工具异常转换实验（ZeroDivisionError 已验证）
 ├── langgraph_human_in_the_loop_demo.py                 # Human-in-the-loop 审批（approve/reject 已验证）
 ├── langgraph_human_in_the_loop_sqlite_demo.py          # SqliteSaver 跨进程 HITL（approve/reject 已验证）
+├── langgraph_mcp_demo.py                               # MCP Client + Agent，接入真实天气 MCP
+├── mcp_server/
+│   └── get_weather_mcp/server.py                       # FastMCP 天气服务端，调用和风天气接口
 ├── .gitignore            # 版本控制排除规则，见 3.4 节
 ├── requirements.txt
 ├── short-memory.db       # 本地 SQLite 运行产物；当前无脚本写入，见 4.11 节
@@ -175,21 +178,30 @@ dive-into-langgraph/          <- 嵌套的课程仓库，不纳入根仓库跟�
 - `google-search-results`：为 `tools.py` 提供 SerpApi 客户端。
 - `openai`：OpenAI 兼容 SDK 的底层依赖。
 - `ipython`：消息展示和 Notebook 支持。
+- `fastmcp`：实现独立 MCP Server。
+- `langchain-mcp-adapters`：发现 MCP Server 工具并适配成 LangChain Agent 工具。
+- `httpx`：天气 MCP Server 调用外部天气 HTTP API。
+- 和风天气服务：运行时外部 API，不是 Python 包；需配置服务 Host 和密钥。
 
-`requirements.txt` 当前明确声明：
+`requirements.txt` 当前明确声明的主要运行依赖包括：
 
 ```text
-openai
-python-dotenv
-google-search-results
-ipython
-langchain>=1.0
-langchain-openai
+openai>=2.0
+python-dotenv>=1.2.2
+google-search-results>=2.4.2
+ipython>=9.0
+pydantic>=2.13
+langchain>=1.3.11
+langchain-openai>=1.3.3
+langgraph>=1.2.6
+langgraph-checkpoint-sqlite>=3.1.0
+fastmcp>=3.4.2
+langchain-mcp-adapters>=0.3.0
+httpx>=0.27
 ```
 
 当前本地环境曾实际观察到 Python 3.13.1、LangChain 1.3.14、LangChain OpenAI 1.4.1、LangGraph 1.2.10。这些是本地环境事实，不是项目锁定版本。
 
-当前代码直接使用了 `langgraph` 和 `pydantic`，但它们尚未在根目录 requirements.txt 中作为直接依赖明确声明。未来整理依赖时应补充，而不是依赖传递安装。
 
 ### 4.2 环境变量
 
@@ -203,6 +215,8 @@ langchain-openai
 - `SERPAPI_API_KEY`
 - `BASIC_MODEL_ID`（`langgraph_middleware_hooks_demo.py` 的低费率模型，2026-09-10 新增）
 - `ADVANCED_MODEL_ID`（同上，高费率 / 默认模型）
+- `QWEATHER_API_HOST`（天气 MCP Server 使用的天气 API Host；只记录名称，不记录真实值）
+- `QWEATHER_API_KEY`（天气服务凭据；不得打印或提交）
 
 仓库已有根目录 `.gitignore`（2026-09-10 新增，内容与排除项见 3.4 节）。新增敏感配置或运行产物目录时，必须同步补充排除规则，并用 `git check-ignore -v <路径>` 验证生效。
 
@@ -215,6 +229,9 @@ langchain-openai
 - `get_weather(city)`：固定返回演示天气文本，不是真实天气服务。
 - `get_user_info(runtime)`：从 `runtime.store` 按 `("users",)` 和当前 `user_id` 精确读取用户资料。
 - `save_user_info(user_info, runtime)`：读取旧资料，将新资料合并后写回 Store；相同 key 由新值覆盖旧值。
+
+注意：`tools.py` 中的 `get_weather` 仍是固定文本的教学工具；真实天气接入由独立的
+`mcp_server/get_weather_mcp/server.py` 提供，两者不是同一个实现。
 
 当前 `Context` 和 `UserInfo` 的主要结构为：
 
@@ -418,7 +435,7 @@ model_name: nvidia/nemotron-3.5-lightning:free
 
 **必须记住的坑**：hook 返回的自定义 State 字段**必须**出现在合并后的 State schema 中，否则会被**静默丢弃且不报错**。已实测：未声明 `state_schema` 时返回 `{"model_call_count": 99}`，最终读出 `None`；声明后读出 `99`。
 
-**未覆盖的部分**：多个同类型 middleware 的组合顺序；`can_jump_to` 跳转；消息裁剪；`wrap_model_call` 的**短路 / 重试**（"换模型"用法已覆盖，见上）；`wrap_tool_call`。本实验刻意不使用假模型 / Mock，因此不存在"不联网、可重复"的确定性验证路径——每次验证都是一次真实模型运行。
+**本文件未覆盖的部分**：多个同类型 middleware 的组合顺序；`can_jump_to` 跳转；消息裁剪；`wrap_model_call` 的短路 / 重试（短路已在 4.12 节独立实验观察，重试仍未做）；`wrap_tool_call`。本实验刻意不使用假模型 / Mock，因此不存在"不联网、可重复"的确定性验证路径——每次验证都是一次真实模型运行。
 
 ### 4.9 `langgraph_react.py`
 
@@ -770,6 +787,37 @@ SqliteStore
 - `edit`、`respond` 决策。
 - Postgres 等远程 checkpoint、并发、审批身份、超时、审计、备份和幂等控制。
 
+### 4.18 MCP 天气服务：`langgraph_mcp_demo.py` 与 `mcp_server/get_weather_mcp/server.py`
+
+这是首个把独立 MCP Server 接入 `create_agent` 的端到端学习实验：
+
+```text
+langgraph_mcp_demo.py
+  -> MultiServerMCPClient 以 stdio 启动 server.py 子进程
+  -> get_tools() 发现 MCP 工具并适配为 LangChain 工具
+  -> create_agent / ainvoke
+  -> 模型产生 get_weather tool_call
+  -> MCP Client 转发到 FastMCP Server
+  -> 天气服务城市查询得到经纬度
+  -> 按坐标请求当前天气
+  -> 工具结果返回 Agent，模型整理成自然语言
+```
+
+当前服务端实现要点：
+
+- `FastMCP("get_weather_mcp")` 创建服务，`@mcp.tool` 将 `get_weather(city)` 注册为 MCP 能力；服务端只提供工具，不负责决定模型何时调用。
+- `langgraph_mcp_demo.py` 用 `sys.executable` 启动子进程，保证 MCP Server 使用当前虚拟环境。
+- 服务端从仓库根目录 `.env` 读取 `QWEATHER_API_HOST`、`QWEATHER_API_KEY`，以请求头传递密钥；不要在日志或文档中记录凭据值。
+- `QWEATHER_API_HOST` 当前按纯 Host 使用，代码会补上 `https://`；配置中若也写 scheme 会形成错误地址。
+- 工具先请求城市地理查询，再用返回坐标请求实时天气；当前只查中国范围，同名地点默认取第一个候选。
+- HTTP 超时设为 10 秒；HTTP 状态错误和网络错误会转换成可读的工具结果，当前没有自动重试，也未统一处理所有 JSON/schema 异常。
+- 返回值只挑选天气状况、温度、体感、湿度和数据归属信息，避免将完整响应 JSON 全部放进模型上下文。
+- 湿度格式化当前假设 `humidity` 是 0–1 的比例并乘以 100；必须对照实际接口 Schema 和运行返回确认，不能把代码假设视为已验证事实。
+- `stdio` 的 stdout 是 MCP 协议通道，服务端不应在该通道打印普通调试日志；需要诊断时应使用 stderr 日志。
+- 用户问题中的“今天”目前调用的是实时天气端点，不是逐日天气预报端点。
+
+验证状态必须区分：维护者先前提供的输出验证了 MCP 工具发现、`tool_call`、工具结果返回和 Agent 继续回答的链路；其中结果文本 `It's always sunny ...` 是旧固定天气示例，**不能证明当前天气 API 已成功返回实时数据**。当前代码已接入真实 HTTP 天气服务，但本次文档更新没有发起外部天气或模型调用；待维护者提供新版运行结果后，再把实时接口成功路径标记为实测通过。
+
 ## 5. 学习进度和路线（Learning Roadmap）
 
 ### 5.1 已完成
@@ -810,6 +858,7 @@ SqliteStore
 - **`tool_error` 工具异常转换**（`langgraph_middleware_tool_error_demo.py`）：已由真实模型运行验证。正常路径中 `divide(10, 2)` 返回 `5.0`；异常路径中 `divide(10, 0)` 抛出 `ZeroDivisionError`，`handle_tool_error` 捕获后返回错误 `ToolMessage`，Agent 没有崩溃并继续生成最终回答。当前仅覆盖 `ZeroDivisionError`，其他异常、重试和超时仍未做。
 - **Human-in-the-loop 基础审批**（`langgraph_human_in_the_loop_demo.py`）：已由真实模型运行验证 `HumanInTheLoopMiddleware` 产生 `__interrupt__`、相同 `thread_id` 恢复，以及 `approve` 执行工具、`reject` 跳过工具并返回拒绝 `ToolMessage` 两条同进程路径。当前文件刻意保留 `InMemorySaver`，用于对照持久化版本。
 - **SqliteSaver 跨进程 Human-in-the-loop**（`langgraph_human_in_the_loop_sqlite_demo.py`）：已于 **2026 年 9 月 21 日**由真实模型运行验证。`test01` 在两个独立进程中完成 `approve`，工具返回 `224.6`；`test02` 在两个独立进程中完成 `reject`，工具未执行并返回拒绝 `ToolMessage`，两条路径均没有新的中断。错误 `thread_id`、`edit` / `respond` 和生产级审批能力尚未验证。
+- **MCP 工具发现与 Agent 调用链**（`langgraph_mcp_demo.py`）：已通过 stdio Client 启动 FastMCP Server、发现工具并观察 Agent 工具调用与结果回传。服务端当前代码已改为请求真实天气 API；之前输出中的固定文本 `It's always sunny ...` 仅验证旧 mock 数据链路，不能作为当前实时天气接口成功凭证。最新真实 API 结果待维护者运行确认，详见 4.18 节。
 
 根据 `dive-into-langgraph` 课程，以下章节标记为已完成：
 
@@ -831,6 +880,8 @@ SqliteStore
 实际:  Context Engineering（Runtime+Store / State / @dynamic_prompt）已完成
        -> Middleware（dynamic_prompt / before_model / after_model）已完成，并由真实模型运行实测通过
        -> SqliteStore 持久化验收【已完成，课程 Notebook 形式】
+       -> Human-in-the-loop 同进程与 SqliteSaver 跨进程 approve/reject 已验证
+       -> MCP stdio 工具发现链已运行；天气 Server 现已接入真实 HTTP API，最新实时返回待确认
 ```
 
 **SqliteStore 这一项的结论（2026-09-10 维护者确认，原"顺序偏离"记录作废）**：
@@ -844,7 +895,9 @@ SqliteStore
 当前重点：Middleware 的核心实验已经完成，包括模型 wrapper 短路、工具观察、权限
 短路和工具异常转换；Human-in-the-loop 的同进程和 `SqliteSaver` 跨进程
 `approve` / `reject` 最小路径也已经通过真实模型验证。可选补充 Middleware 的有限
-重试或超时控制，但不再阻塞主学习路线；下一步进入 MCP。
+重试或超时控制，但不再阻塞主学习路线。当前已进入 MCP：stdio Client/Server 与真实天气
+HTTP 查询代码已接通；先以更新后的运行结果确认真实接口路径，再进入 RAG。旧固定天气
+输出只验证了 MCP 工具调用链，不作为真实天气服务的成功凭证。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -853,10 +906,10 @@ SqliteStore
 ```text
 1. SqliteStore 持久化验收                              [已完成，课程 Notebook 形式；根目录实验刻意保留 InMemoryStore]
 2. Context Engineering                                 [已完成]
-3. Middleware                                          [进行中]
+3. Middleware                                          [核心实验已完成，可选机制待补]
    -> dynamic_prompt                                   [已完成]
    -> before_model / after_model                       [已完成，真实模型实测通过]
-   -> wrap_model_call                                  [进行中：换模型与短路已验证；重试未做]
+   -> wrap_model_call                                  [换模型与短路已验证；重试未做]
    -> wrap_tool_call                                   [已完成：拆分后真实运行通过；重试 / 超时未做]
    -> tool_guard                                       [已完成：拆分后真实运行通过；通用权限矩阵未做]
    -> tool_error                                       [已完成：ZeroDivisionError -> ToolMessage 已验证]
@@ -864,6 +917,8 @@ SqliteStore
    -> interrupt / 审批 / Command(resume=...)                   [已完成：approve/reject]
    -> SqliteSaver 跨进程暂停、审批和恢复                          [已完成：test01/test02]
 5. MCP Server 和外部工具协议
+   -> stdio Client/Server 与工具发现                       [代码已接通；旧固定天气链路已运行]
+   -> 真实天气 HTTP 查询                                  [代码已接入；最新实时 API 结果待验证]
 6. RAG：加载、切分、索引、检索、引用
 7. Parallelization / Subgraph / Map-Reduce
 8. Supervisor / Multi-Agent
@@ -1173,7 +1228,7 @@ Store / SqliteStore
 ### 11.1 语法检查
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
 ### 11.2 LangGraph Agent 实验
@@ -1196,11 +1251,21 @@ Store / SqliteStore
 
 该脚本会访问 Embedding 和 Chat API；它是手动实验，不是正式自动化测试。
 
-### 11.4 课程目录
+### 11.4 MCP 天气 Agent
+
+```powershell
+.\.venv\Scripts\python.exe langgraph_mcp_demo.py
+```
+
+该入口会启动 MCP stdio 子进程、调用真实天气服务并调用 LLM。运行前需配置 `.env` 中的
+`LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`QWEATHER_API_HOST` 和 `QWEATHER_API_KEY`；
+会产生外部请求，静态检查时不要运行它。
+
+### 11.5 课程目录
 
 课程 Notebook、脚本和项目配置位于 `dive-into-langgraph/` 内，应使用已有 IDE 或已配置的 Notebook 环境打开。不要把课程目录的命令未经验证地写成根项目命令。
 
-### 11.5 测试和构建
+### 11.6 测试和构建
 
 - 当前没有正式测试命令。
 - 当前没有构建命令。
@@ -1215,11 +1280,12 @@ Store / SqliteStore
 - 该实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此每次验证都会产生真实 API 调用与费用，结果受模型当时行为影响，不是确定性的。文件内没有自检路径。
 - **`wrap_model_call` 已完成的部分**：课程的"换模型"用法（`request.override(model=...)`）、`request.state` 只读读取、`handler(request)` 才真正发起调用——均已随课程"预算控制"复现验证，见 4.8 / 5.1 节。
 - **`wrap_model_call` 的短路已完成初步验证**（`langgraph_middleware_wrap_model_call_demo.py`）：真实运行中通过消息命中“本地缓存”条件，直接得到 `[来自本地缓存，未调用模型]`，没有工具调用和后续模型轮次。随后加入 `provider_call_probe`，普通请求进入探针并计数为 1，缓存请求未进入探针；调用 N 次的重试仍未做。
+  - **判据警告**：`before_model` 的计数不能证明“模型没被调用”，因为它在 wrapper 上游；应结合 wrapper/provider 探针和响应元数据判断。
 - **`wrap_tool_call` 工具观察与 `tool_guard` 权限控制已完成**：维护者于 2026 年 9 月 18 日重新运行两个拆分后的独立文件，确认工具观察、`handler(request)` 执行工具、`admin` 放行和 `user` 短路路径均通过。重试、超时、通用权限矩阵和审批仍未做。
 - **`tool_error` 工具异常转换已完成最小实验**（`langgraph_middleware_tool_error_demo.py`）：真实运行中验证 `divide(10, 0)` 产生 `ZeroDivisionError`，middleware 将其转换为错误 `ToolMessage`，Agent 继续完成下一轮模型处理。下一步可扩展明确异常类型的分类处理，再考虑有限重试；重试必须限定异常类型、次数和退避策略，不能对所有异常无限重试。
 - **Human-in-the-loop 基础审批已完成**（`langgraph_human_in_the_loop_demo.py`）：2026 年 9 月 18 日真实运行验证了 `__interrupt__`、同一 `thread_id` 恢复、`approve` 执行工具和 `reject` 返回“工具未执行”的 `ToolMessage`，且当前提示词下拒绝后没有新的工具调用。`edit` / `respond`、持久化 checkpoint、审批身份、超时和审计仍未做。
 - **SqliteSaver 跨进程 Human-in-the-loop 已完成**（`langgraph_human_in_the_loop_sqlite_demo.py`）：2026 年 9 月 21 日真实运行验证 `test01` 的 approve 和 `test02` 的 reject。两个独立 Python 进程使用同一个 `hitl-checkpoint.db` 和同一个 `thread_id` 恢复成功；approve 执行 `divide` 并返回 `224.6`，reject 返回工具未执行的 `ToolMessage`，两条路径均没有新的中断。错误 `thread_id`、`edit` / `respond`、审批身份、超时和审计仍未做。
-  - **判据警告**：`before_model` 的计数**不能**用来证明"模型没被调用"——它在包裹器上游，短路时早已执行完（原因见 4.8 节）。正确判据是响应元数据：真实响应带 `response_metadata.model_name` / `usage_metadata`，本地伪造的 `AIMessage` 这两项为空。
+- **MCP 真实天气服务代码已接通**（`langgraph_mcp_demo.py` + `mcp_server/get_weather_mcp/server.py`）：stdio 工具发现与 Agent 工具调用链已有旧示例运行记录；当前服务端已改为请求真实天气 API。新的实时天气接口结果尚未由本次任务执行验证，见 4.18 节。
 
 ### 12.2 Store 持久化验收（已关闭）
 
@@ -1238,15 +1304,14 @@ Store / SqliteStore
 
 ### 12.4 工程与文档基础设施
 
-- 将 `langgraph`、`pydantic` 等直接使用的依赖补充到 `requirements.txt`。
 - README.md 已创建，记录实验顺序、架构图、运行前提、真实进度和已确定但尚未实现的 RepoResearcher 方向。
-- 为 StateGraph 路由、工具权限、资料合并和 Store 隔离建立最小测试，避免每次验证都产生外部调用和费用（原则见 10.2 节）。当前仓库**尚未建立**任何此类测试；已有的 Context / Middleware 实验全部采用真实模型手动验证，不使用假模型 / Mock。
+- 为 StateGraph 路由、工具权限、资料合并、Store 隔离和天气响应解析建立最小测试，避免每次验证都产生外部调用和费用（原则见 10.2 节）。当前仓库**尚未建立**任何此类测试；已有的 Context / Middleware 实验全部采用真实模型手动验证，不使用假模型 / Mock。
 
 ### 12.5 后续学习任务
 
 - 使用错误 `thread_id` 完成 Human-in-the-loop 的跨会话负向恢复验证。
 - 验证 Human-in-the-loop 的 `edit` / `respond` 决策，并补充审批身份、超时、审计和幂等设计。
-- 学习 MCP、RAG、Subgraph、并行和 Supervisor/Multi-Agent。
+- 运行 MCP 天气 Agent，确认真实天气接口的成功返回和配置/网络失败返回；随后学习 RAG、Subgraph、并行和 Supervisor/Multi-Agent。
 - 选择最终简历项目的真实业务场景。
 - 建立评估数据、Trace、成本统计和失败分析机制。
 - 在具备足够基础后，开始按组件阅读 DeerFlow 源码，并记录架构对照笔记。
