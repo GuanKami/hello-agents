@@ -6,9 +6,9 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 9 月 23 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已接入独立 FastMCP Server，服务端代码已改为请求真实天气 API。
+> 截至 2026 年 9 月 26 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter`，并完成真实天气调用验证。
 >
-> 当前先用更新后的 MCP Agent 确认真实天气 API 返回，再进入 RAG。此前输出里的 `It's always sunny ...` 来自固定天气示例，只能证明旧版 MCP 工具链可运行，不代表真实天气接口验证通过。
+> 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。下一阶段进入 RAG。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
 ## 项目目标
 
@@ -104,13 +104,15 @@ LLM API
 
 ### MCP 与真实天气服务
 
-- `langgraph_mcp_demo.py` 使用 `MultiServerMCPClient` 以 stdio 启动独立 MCP Server，并通过 `get_tools()` 发现工具，再交给 `create_agent`。
+- `langgraph_mcp_demo.py` 使用 LangChain 内置 `MCPAdapter`，通过 `mcpServers` 配置以 stdio 启动独立 MCP Server，并在 `async with` 生命周期内调用 `list_tools()` 发现工具，再交给 `create_agent`。
+- Agent 的 `ainvoke()` 也在适配器上下文内完成，以保证模型运行期间 MCP 连接仍然有效；Agent 仍负责 ReAct 工具循环，适配器只负责 MCP 连接和工具适配。
 - `mcp_server/get_weather_mcp/server.py` 使用 FastMCP 暴露 `get_weather`，并通过 HTTP 调用和风天气服务：先把中国城市名解析为经纬度，再请求当前天气。
 - 共享模块 [`tools.py`](tools.py) 中仍保留一个固定文本的 `get_weather` 教学工具；本实验不会直接导入它，而是使用 MCP Server 发现到的真实天气工具。
-- 已有旧版本输出验证了工具发现、模型生成 `tool_call`、工具结果返回和 Agent 继续回答的流程；其中固定的“始终晴朗”内容不属于实时天气结果。
-- 当前代码已经接入真实天气 HTTP API；本次文档更新没有重新发起真实天气或 LLM 请求，因此新的实时天气返回仍需本地运行确认。服务端还假设湿度字段是 0–1 的比例，需核对供应商实际 Schema 后再确认转换结果。
+- 维护者于 **2026 年 9 月 26 日**使用 `MCPAdapter` 运行两次真实请求，均发现并调用 `get_weather(city="北京")`，工具结果经 MCP 返回给 Agent，模型随后作答。两次结果分别包括晴间多云（26.59°C、体感 28.79°C、湿度约 59%）和小雨（18°C、体感 17.83°C、湿度约 90%）。
+- 这些记录证明两次单工具实时天气请求成功，不代表多工具 ReAct 循环、其他城市、异常路径或逐日天气预报已验证。湿度结果与服务端按 0–1 比例格式化的假设相符，但不替代完整 Schema 和边界值检查。地点名“北京市北京”仍有重复，可后续修正展示。
+- 此前输出里的固定“始终晴朗”内容属于旧教学工具，不是实时天气结果。
 
-当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时、审计、真实天气 API 的新版运行确认、RAG、Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时、审计、RAG、Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
@@ -130,8 +132,8 @@ LLM API
 | [`langgraph_middleware_tool_error_demo.py`](langgraph_middleware_tool_error_demo.py) | 捕获 `ZeroDivisionError` 并转换为错误 `ToolMessage` | 已完成真实模型验证 |
 | [`langgraph_human_in_the_loop_demo.py`](langgraph_human_in_the_loop_demo.py) | `interrupt`、审批、checkpoint 和 `Command(resume=...)` | approve/reject 已验证，持久化恢复未做 |
 | [`langgraph_human_in_the_loop_sqlite_demo.py`](langgraph_human_in_the_loop_sqlite_demo.py) | `SqliteSaver`、`start/resume` 和跨进程 checkpoint 恢复 | approve/reject 已验证，负向 thread_id/edit/respond 未做 |
-| [`langgraph_mcp_demo.py`](langgraph_mcp_demo.py) | MCP stdio Client、工具发现与 Agent 工具循环 | 旧固定天气链路已运行；新真实天气 API 路径待运行确认 |
-| [`mcp_server/get_weather_mcp/server.py`](mcp_server/get_weather_mcp/server.py) | FastMCP 天气 Server，通过 HTTP 查询真实天气 | 已接入和风天气 API；本次未调用外部接口 |
+| [`langgraph_mcp_demo.py`](langgraph_mcp_demo.py) | 内置 `MCPAdapter`、stdio 工具发现与 Agent 调用 | 已验证两次真实天气调用、结果回传和回答（2026-09-26）；多工具循环及异常路径未验证 |
+| [`mcp_server/get_weather_mcp/server.py`](mcp_server/get_weather_mcp/server.py) | FastMCP 天气 Server，通过 HTTP 查询真实天气 | 已接入和风天气 API；两次北京实时天气请求成功（2026-09-26） |
 
 根目录的 `dive-into-langgraph/` 是独立的课程源码仓库，必须保留；`.agents/skills/dive-into-langgraph/` 是本地学习 Skill，也必须保留。
 
@@ -155,7 +157,7 @@ hello-agents/
 ├── langgraph_middleware_tool_error_demo.py      # 工具异常转换
 ├── langgraph_human_in_the_loop_demo.py          # Human-in-the-loop 审批
 ├── langgraph_human_in_the_loop_sqlite_demo.py   # SqliteSaver 跨进程 HITL
-├── langgraph_mcp_demo.py                        # MCP Client + Agent
+├── langgraph_mcp_demo.py                        # MCPAdapter + Agent
 ├── mcp_server/
 │   └── get_weather_mcp/server.py                # FastMCP + 真实天气 API
 ├── requirements.txt                              # Python 依赖声明
@@ -176,14 +178,14 @@ hello-agents/
 - Pydantic
 - python-dotenv
 - FastMCP
-- langchain-mcp-adapters
+- `langchain[mcp]`（内置 `MCPAdapter`，当前 Beta）
 - httpx
 - 和风天气 HTTP API（运行时外部服务）
 - OpenAI 兼容接口
 - SerpApi（共享搜索工具使用）
 - IPython（消息展示和 Notebook 支持）
 
-根目录 `requirements.txt` 是当前明确声明的依赖列表，包含 LangChain、LangGraph、Pydantic、FastMCP、`langchain-mcp-adapters` 和 `httpx` 等当前实验依赖。和风天气是运行时外部服务，不是可通过 pip 安装的包。
+根目录 `requirements.txt` 是当前明确声明的依赖列表，包含 `langchain[mcp]>=1.4.2`、FastMCP `>=4.0.10,<5`、LangGraph、Pydantic 和 `httpx` 等实验依赖；MCP 集成由 LangChain 内置适配器提供，不再单独依赖 `langchain-mcp-adapters`。和风天气是运行时外部服务，不是可通过 pip 安装的包。
 
 ## 环境配置
 
@@ -293,7 +295,7 @@ MCP 命令会启动本地 stdio Server，并请求真实天气 API 和 LLM；可
 Middleware
   -> wrap_model_call 重试 / fallback（可选补充）
   -> Human-in-the-loop edit/respond 与负向 thread_id 验证（可选补充）
-  -> MCP 天气 Agent（stdio Client/Server 已接通；真实天气返回待确认）
+  -> MCP 天气 Agent（已验证两次真实天气工具调用和结果回传；其他路径未验证）
   -> RAG
   -> Subgraph / Parallel / Map-Reduce
   -> Supervisor / Multi-Agent

@@ -13,10 +13,9 @@ langgraph-checkpoint-sqlite>=3.1.0
 
 # MCP 实验依赖
 #
-# fastmcp 用于创建 MCP Server；
-# langchain-mcp-adapters 将 MCP Server 暴露的工具适配为 LangChain Agent 工具。
-fastmcp>=3.4.2
-langchain-mcp-adapters>=0.3.0
+# fastmcp 用于创建独立 MCP Server；langchain[mcp] 提供 LangChain 内置 MCPAdapter。
+fastmcp>=4.0.10,<5
+langchain[mcp]>=1.4.2
 httpx>=0.27
 
 # 课程后续章节依赖
