@@ -6,9 +6,26 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 9 月 26 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter`，并完成真实天气调用验证。
+> 截至 2026 年 9 月 27 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter` 并完成真实天气调用；固定两步向量 RAG 已完成一次正向端到端运行。
 >
-> 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。下一阶段进入 RAG。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
+> 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。2026 年 9 月 27 日的 RAG 运行读取 2 份 Markdown 并切分为 9 个文本块，但只验证了一个问题；引用片段对应关系、改写问题、跨文档问题和无答案问题仍待验收。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
+
+### RAG 基础流程
+
+[`langgraph_rag_demo.py`](langgraph_rag_demo.py) 是固定两步 StateGraph RAG 实验，不是 Agentic RAG：
+
+```text
+本地 Markdown -> 文档切块 -> Embedding / InMemoryVectorStore
+    -> retrieve 节点写入 RAGState.documents
+    -> generate 节点显式构造模型上下文并生成答案
+```
+
+- 知识库位于 [`rag_docs/`](rag_docs/)；目前包括 `react.md` 和 `stategraph.md`。
+- `RecursiveCharacterTextSplitter` 使用 `chunk_size=400`、`chunk_overlap=80`，并记录 `start_index`，便于回看文本块在原文中的位置。
+- 图内的 `retrieve` 节点从向量库取 Top-3 文档，`generate` 节点将问题和证据片段组装为消息。文档保存在 State 中并不意味着 LangGraph 会自动把它们传给 LLM。
+- 维护者于 **2026 年 9 月 27 日**运行一次正向问题：2 份原始文档切为 9 个片段；“StateGraph 中 State、Node、Edge 分别负责什么？”召回 3 个 `stategraph.md` 片段，分数为 `0.7990`、`0.7802`、`0.7171`，随后完成生成并在 State 中保留召回文档。
+- 当前只能判定固定的 `retrieve -> generate` happy path 跑通。一次回答把 Edge 的来源标在 `start=0`，而更直接的定义位于 `start=339`。最新回答虽出现 `[D1]`、`[D2]`，但代码只把这些编号列入提示词的允许清单，上下文片段仍没有对应编号，因此无法把引用映射回具体证据，引用准确性尚未通过验收。
+- 运行时会重新嵌入文档，并分别执行一次独立诊断检索和一次图内检索；会访问 Embedding 与 Chat API，可能产生费用。`InMemoryVectorStore` 仅在当前进程有效。
 
 ## 项目目标
 
@@ -112,12 +129,13 @@ LLM API
 - 这些记录证明两次单工具实时天气请求成功，不代表多工具 ReAct 循环、其他城市、异常路径或逐日天气预报已验证。湿度结果与服务端按 0–1 比例格式化的假设相符，但不替代完整 Schema 和边界值检查。地点名“北京市北京”仍有重复，可后续修正展示。
 - 此前输出里的固定“始终晴朗”内容属于旧教学工具，不是实时天气结果。
 
-当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时、审计、RAG、Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时和审计；RAG 的引用对齐、多问题验收及 BM25 / 混合检索；以及 Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
 | 文件 | 学习内容 | 当前状态 |
 | --- | --- | --- |
+| [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步向量 RAG：加载、切分、检索、State 传递、生成 | 基础正向链路一次端到端运行（2026-09-27）；引用对齐和多问题验收待完成 |
 | [`tools.py`](tools.py) | 共享工具、权限控制、用户资料读写 | 已使用 |
 | [`langgraph_react.py`](langgraph_react.py) | 高层 `create_agent` Agent API | 学习实验，存在待修正缺陷 |
 | [`langgraph_state_react.py`](langgraph_state_react.py) | 显式 StateGraph ReAct 和 ToolNode | 已完成基础实验 |
@@ -158,6 +176,10 @@ hello-agents/
 ├── langgraph_human_in_the_loop_demo.py          # Human-in-the-loop 审批
 ├── langgraph_human_in_the_loop_sqlite_demo.py   # SqliteSaver 跨进程 HITL
 ├── langgraph_mcp_demo.py                        # MCPAdapter + Agent
+├── langgraph_rag_demo.py                        # 固定 retrieve -> generate RAG 图
+├── rag_docs/
+│   ├── react.md                                  # RAG 知识库样例
+│   └── stategraph.md                             # RAG 知识库样例
 ├── mcp_server/
 │   └── get_weather_mcp/server.py                # FastMCP + 真实天气 API
 ├── requirements.txt                              # Python 依赖声明
@@ -179,6 +201,7 @@ hello-agents/
 - python-dotenv
 - FastMCP
 - `langchain[mcp]`（内置 `MCPAdapter`，当前 Beta）
+- `langchain-text-splitters`（RAG 文档切分）
 - httpx
 - 和风天气 HTTP API（运行时外部服务）
 - OpenAI 兼容接口
@@ -221,6 +244,7 @@ python -m venv .venv
 
 .\.venv\Scripts\python.exe langgraph_state_react.py
 .\.venv\Scripts\python.exe embedding_test.py
+.\.venv\Scripts\python.exe langgraph_rag_demo.py
 .\.venv\Scripts\python.exe langgraph_context_demo.py
 .\.venv\Scripts\python.exe langgraph_state_context_demo.py
 .\.venv\Scripts\python.exe langgraph_middleware_dynamic_prompt_demo.py
@@ -240,7 +264,7 @@ python -m venv .venv
 语法检查可以使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
 MCP 命令会启动本地 stdio Server，并请求真实天气 API 和 LLM；可能产生外部请求或费用。运行前需要在根目录 `.env` 配置 `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`QWEATHER_API_HOST` 和 `QWEATHER_API_KEY`。模型、Embedding、搜索和天气工具都可能访问外部 API；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
@@ -296,7 +320,8 @@ Middleware
   -> wrap_model_call 重试 / fallback（可选补充）
   -> Human-in-the-loop edit/respond 与负向 thread_id 验证（可选补充）
   -> MCP 天气 Agent（已验证两次真实天气工具调用和结果回传；其他路径未验证）
-  -> RAG
+  -> 固定两步向量 RAG happy path 已运行验证；引用对齐、改写问题、跨文档与无答案验收待完成
+  -> BM25 / 混合检索
   -> Subgraph / Parallel / Map-Reduce
   -> Supervisor / Multi-Agent
   -> Evaluation / Observability

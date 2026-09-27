@@ -74,6 +74,10 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_human_in_the_loop_demo.py                 # Human-in-the-loop 审批（approve/reject 已验证）
 ├── langgraph_human_in_the_loop_sqlite_demo.py          # SqliteSaver 跨进程 HITL（approve/reject 已验证）
 ├── langgraph_mcp_demo.py                               # MCPAdapter + Agent，接入真实天气 MCP
+├── langgraph_rag_demo.py                               # 固定两步向量 RAG：retrieve -> generate
+├── rag_docs/                                            # RAG 实验用的本地 Markdown 知识库
+│   ├── react.md
+│   └── stategraph.md
 ├── mcp_server/
 │   └── get_weather_mcp/server.py                       # FastMCP 天气服务端，调用和风天气接口
 ├── .gitignore            # 版本控制排除规则，见 3.4 节
@@ -172,6 +176,7 @@ dive-into-langgraph/          <- 嵌套的课程仓库，不纳入根仓库跟�
 - Python。
 - `langchain[mcp]`：Agent API、消息和工具抽象，并提供内置 `MCPAdapter`（当前 Beta）。
 - `langchain-openai`：通过 OpenAI 兼容接口创建 `ChatOpenAI` 和 `OpenAIEmbeddings`。
+- `langchain-text-splitters`：将原始文档切分为可检索的文本块。
 - `langgraph`：StateGraph、ToolNode、checkpoint 和 Store 运行时能力。
 - `pydantic`：`Context` 等运行时数据结构。
 - `python-dotenv`：加载 `.env`。
@@ -193,6 +198,7 @@ pydantic>=2.13
 langchain>=1.3.11
 langchain[mcp]>=1.4.2
 langchain-openai>=1.3.3
+langchain-text-splitters>=1.1.2
 langgraph>=1.2.6
 langgraph-checkpoint-sqlite>=3.1.0
 fastmcp>=4.0.10,<5
@@ -823,6 +829,41 @@ langgraph_mcp_demo.py
 
 验证状态：维护者于 **2026 年 9 月 26 日**用 `MCPAdapter` 真实运行确认 `get_weather` 工具发现、Agent 生成 `tool_call`、MCP Server 调用天气 API、结果回传和模型基于结果作答。两次独立输出分别记录晴间多云（26.59°C、体感 28.79°C、湿度约 59%）与小雨（18°C、体感 17.83°C、湿度约 90%），均带和风天气 attribution。此前 `It's always sunny ...` 是旧固定天气示例，不作为真实天气验证证据。当前只验证了两次单工具请求，不代表逐日预报、其他城市、异常分支或完整 Schema 已验证。
 
+### 4.19 固定两步向量 RAG：`langgraph_rag_demo.py`
+
+这是一个使用显式 StateGraph 的基础 RAG 实验，固定执行 `START -> retrieve -> generate -> END`。它用于理解“检索证据”和“模型生成”两个阶段如何通过 State 衔接；模型不决定是否检索，因此这不是 Agentic RAG。
+
+实验数据与组件：
+
+```text
+rag_docs/*.md
+  -> load_documents(): Document(page_content, metadata.source)
+  -> RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80, add_start_index=True)
+  -> OpenAIEmbeddings + InMemoryVectorStore
+  -> retrieve 节点：按问题召回 Top-3 Document
+  -> RAGState.documents
+  -> generate 节点：显式组装问题与来源片段，调用 ChatOpenAI
+  -> RAGState.answer
+```
+
+关键设计点：
+
+- `Document.metadata` 保留文件名和切块起始位置，便于把召回证据追溯到原文。
+- `RAGState` 显式传递 `question`、`documents` 和 `answer`。把文档写进 State 不会自动把它们送给 LLM；`generate_node` 必须把片段拼进消息上下文。
+- `InMemoryVectorStore` 仅用于当前进程内的学习和观察，不是持久化向量数据库；每次运行都会重新建立索引。
+- 脚本在调用图前进行一次独立带分数检索，之后 `graph.invoke()` 内的 `retrieve_node` 会再次检索，因此问题向量会重复计算一次。这是为了分别观察检索与完整图运行，不是生产优化方案。
+- `similarity_search_with_score()` 的分数用于检查当前结果排序，不应直接视为答案正确率或跨后端通用阈值。
+
+验证状态：维护者于 **2026 年 9 月 27 日**提供一次端到端运行输出：加载 2 份 Markdown 文档，切分为 9 个文本块；针对“StateGraph 中 State、Node、Edge 分别负责什么？”召回 3 个 `stategraph.md` 片段，分数依次为 `0.7990`、`0.7802`、`0.7171`。生成节点基于召回资料回答，图执行后的 State 中也保留了同一批文档。由此确认**固定两步向量 RAG 的基础 happy path 已跑通**。
+
+当前限制与未完成项：
+
+- 只验证了一个正向问题，未验证改写问法、对 `react.md` 的检索、无答案问题、检索失败或引用稳定性。
+- 一次回答将 Edge 的来源标注为 `start=0`；更直接定义 Edge 的片段位于 `start=339`，因此该次引用位置不够准确。
+- 后续回答文本虽然出现 `[D1]`、`[D2]`，但 `generate_node` 的上下文块仍只包含 `source` / `start`。`available_citations` 只是提示词中的允许编号清单，没有建立编号到具体 `Document` 的映射；模型输出编号不等于引用已被证据支持，引用准确性仍未验证。
+- 当前没有 BM25、混合检索、重排、相关性阈值、持久化向量库或自动评估集。
+- 运行会访问 Embedding 与 Chat API；注意网络和额度。文档与向量索引均只在当前进程内使用。
+
 ## 5. 学习进度和路线（Learning Roadmap）
 
 ### 5.1 已完成
@@ -842,6 +883,8 @@ langgraph_mcp_demo.py
 - 长期记忆、`user_id`、Store、结构化用户资料读写。
 - `save_user_info` 的增量字典合并：新 key 加入，相同 key 新值覆盖旧值。
 - Embedding 和 InMemoryStore 语义检索最小实验。
+- 固定两步向量 RAG 基础链路：本地 Markdown 加载、切块、向量索引、Top-K 检索、State 传递和 LLM 生成（`langgraph_rag_demo.py`；一次正向问题已端到端运行）。
+- RAG 检索结果分数观察：已确认单次问题的 Top-3 相关片段及排序；分数不是正确率，且未完成跨问题评估。
 - `InMemoryStore` 的进程生命周期限制。
 - **`SqliteStore` 持久化（课程 Notebook 形式，2026-09-10 维护者确认已完成）**：在 `dive-into-langgraph/6.context.ipynb` 第三节中，用 `sqlite3.connect("user-info.db", check_same_thread=False, isolation_level=None)` 建连接，交给 `SqliteStore(conn)` 作为 Store 后端，用 `store.put(("user_info",), key, value)` 预置资料，再在工具内用 `runtime.store.get(("user_info",), user_id)` 读取。已掌握"**Store 后端可替换、长期资料的生命周期由后端决定**"这一机制。
 
@@ -887,6 +930,7 @@ langgraph_mcp_demo.py
        -> SqliteStore 持久化验收【已完成，课程 Notebook 形式】
        -> Human-in-the-loop 同进程与 SqliteSaver 跨进程 approve/reject 已验证
        -> MCPAdapter 工具发现、两次真实天气工具调用和结果回传已运行验证（2026-09-26）
+       -> 固定两步向量 RAG 已完成一次正向端到端运行（2026-09-27）；引用定位和多问题验收仍待完善
 ```
 
 **SqliteStore 这一项的结论（2026-09-10 维护者确认，原"顺序偏离"记录作废）**：
@@ -897,12 +941,7 @@ langgraph_mcp_demo.py
 - 将来若需要根目录级别的跨进程长期记忆（例如 HITL 恢复实验，或简历项目要真的记住用户资料），**四个实验都通过 `build_store()` 单点注入 Store**，改这一处即可，不需要重写实验。
 - 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
-当前重点：Middleware 的核心实验已经完成，包括模型 wrapper 短路、工具观察、权限
-短路和工具异常转换；Human-in-the-loop 的同进程和 `SqliteSaver` 跨进程
-`approve` / `reject` 最小路径也已经通过真实模型验证。可选补充 Middleware 的有限
-重试或超时控制，但不再阻塞主学习路线。MCP 已迁移到 `MCPAdapter`，并由维护者于 2026 年
-9 月 26 日通过两次真实天气请求确认工具发现、调用、结果回传和 Agent 回答。下一阶段进入
-RAG；当前仍未验证多城市、逐日预报或天气服务异常分支。
+当前重点已从 MCP 转入 RAG。固定两步向量 RAG 的基础链路已通过一次正向端到端运行。最新回答出现了 `[D1]` / `[D2]`，但当前代码只把这些编号列入提示词白名单，尚未在上下文片段上标注并绑定编号；下一步先让每个上下文块和 `available_citations` 基于同一份 `documents` 顺序生成编号，再核对每条引用确实支持对应结论。之后补充改写问法、跨文档检索和无答案问题的观察，再学习 BM25 与混合检索。上述扩展完成后再进入 Parallelization / Subgraph / Map-Reduce。Middleware 重试、HITL 错误 `thread_id`、`edit/respond` 等属于可选补充，不阻塞主线。MCP 天气实验仍只验证过两次北京单工具实时查询，其他城市、逐日预报和异常路径未覆盖。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -924,7 +963,10 @@ RAG；当前仍未验证多城市、逐日预报或天气服务异常分支。
 5. MCP Server 和外部工具协议
    -> MCPAdapter + stdio Client/Server 工具发现                [已运行验证]
    -> 两次和风天气实时 HTTP 调用与结果回传                    [已运行验证：2026-09-26]
-6. RAG：加载、切分、索引、检索、引用
+6. RAG
+   -> 固定两步向量 RAG：加载、切分、索引、检索、State 传递和生成 [基础链路已验证一次]
+   -> 改写问题、跨文档和无答案验收；修正引用片段对应关系 [待完成]
+   -> BM25 关键词检索与向量 + 关键词混合检索 [待学习]
 7. Parallelization / Subgraph / Map-Reduce
 8. Supervisor / Multi-Agent
 9. Evaluation / Observability / Cost / Failure Analysis
@@ -1252,9 +1294,10 @@ Store / SqliteStore
 
 ```powershell
 .\.venv\Scripts\python.exe embedding_test.py
+.\.venv\Scripts\python.exe langgraph_rag_demo.py
 ```
 
-该脚本会访问 Embedding 和 Chat API；它是手动实验，不是正式自动化测试。
+`embedding_test.py` 和 `langgraph_rag_demo.py` 会访问 Embedding API；RAG 实验还会调用 Chat API。它们是手动实验，不是正式自动化测试。`langgraph_rag_demo.py` 读取根目录 `rag_docs/*.md`，使用进程内 `InMemoryVectorStore`；每次运行都会重新嵌入资料和查询，注意 API 成本。
 
 ### 11.4 MCP 天气 Agent
 
@@ -1316,7 +1359,8 @@ Store / SqliteStore
 
 - 使用错误 `thread_id` 完成 Human-in-the-loop 的跨会话负向恢复验证。
 - 验证 Human-in-the-loop 的 `edit` / `respond` 决策，并补充审批身份、超时、审计和幂等设计。
-- 学习 RAG：从课程的文档加载、切分、索引和检索示例开始，再比较向量检索、关键词检索、混合检索与引用；先做一个能检查检索结果的小实验。
+- **固定两步向量 RAG 基线已完成一次端到端验证**（`langgraph_rag_demo.py`）：2026-09-27 读取 2 份 Markdown、切分 9 块，针对一个 StateGraph 问题召回 3 个 `stategraph.md` 片段，返回分数 `0.7990 / 0.7802 / 0.7171`，生成节点完成回答且 State 保留召回文档。当前只代表这条正向 happy path 通过，不代表整章 RAG 学习完成。
+- RAG 引用仍需改进：一次回答将 Edge 指向 `start=0`，而更直接证据在 `start=339`。最新回答虽出现 `[D1]` / `[D2]`，但上下文块没有这些标签；`available_citations` 仅为提示词白名单，不能映射回片段。需先在上下文块中加入与白名单同源的编号，再验证编号与证据内容相符；随后测试改写问法、跨文档检索和无答案问题。之后学习 BM25 与混合检索。
 - 后续再学习 Subgraph、并行和 Supervisor/Multi-Agent。
 - 选择最终简历项目的真实业务场景。
 - 建立评估数据、Trace、成本统计和失败分析机制。
