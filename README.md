@@ -6,9 +6,9 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 9 月 27 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter` 并完成真实天气调用；固定两步向量 RAG 已完成一次正向端到端运行。
+> 截至 2026 年 9 月 28 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter` 并完成真实天气调用；固定两步向量 RAG 基础链路已完成正向端到端运行，检索片段的临时引用编号也已在一次运行中观察到。
 >
-> 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。2026 年 9 月 27 日的 RAG 运行读取 2 份 Markdown 并切分为 9 个文本块，但只验证了一个问题；引用片段对应关系、改写问题、跨文档问题和无答案问题仍待验收。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
+> 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 RAG 输出读取 2 份 Markdown 并切分为 9 个文本块，Top-3 命中 `stategraph.md` 的 `start=0/339/605` 片段，生成上下文中的 `[D1]`、`[D2]`、`[D3]` 与这三段一一对应；目前只验证了一个问题类型，引用是否充分支持每条结论、改写问题、跨文档问题和无答案问题仍待验收。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
 ### RAG 基础流程
 
@@ -23,8 +23,8 @@
 - 知识库位于 [`rag_docs/`](rag_docs/)；目前包括 `react.md` 和 `stategraph.md`。
 - `RecursiveCharacterTextSplitter` 使用 `chunk_size=400`、`chunk_overlap=80`，并记录 `start_index`，便于回看文本块在原文中的位置。
 - 图内的 `retrieve` 节点从向量库取 Top-3 文档，`generate` 节点将问题和证据片段组装为消息。文档保存在 State 中并不意味着 LangGraph 会自动把它们传给 LLM。
-- 维护者于 **2026 年 9 月 27 日**运行一次正向问题：2 份原始文档切为 9 个片段；“StateGraph 中 State、Node、Edge 分别负责什么？”召回 3 个 `stategraph.md` 片段，分数为 `0.7990`、`0.7802`、`0.7171`，随后完成生成并在 State 中保留召回文档。
-- 当前只能判定固定的 `retrieve -> generate` happy path 跑通。一次回答把 Edge 的来源标在 `start=0`，而更直接的定义位于 `start=339`。最新回答虽出现 `[D1]`、`[D2]`，但代码只把这些编号列入提示词的允许清单，上下文片段仍没有对应编号，因此无法把引用映射回具体证据，引用准确性尚未通过验收。
+- 维护者提供的正向运行结果显示：2 份原始文档切为 9 个片段；“StateGraph 中 State、Node、Edge 分别负责什么？”召回 3 个 `stategraph.md` 片段，最新一次分数为 `0.7994`、`0.7792`、`0.7161`，随后完成生成并在 State 中保留召回文档。另一次结果的分数略有不同，排名相同；这类分数只用于观察本次检索排序，不是答案正确率或概率。
+- 当前固定的 `retrieve -> generate` happy path 已跑通。生成上下文现在为片段附加临时编号：本次 `[D1]` 对应 `start=0`、`[D2]` 对应 `start=339`、`[D3]` 对应 `start=605`，因此回答引用可以定位回本次检索到的片段。编号会随检索结果和排序变化，不是稳定文档 ID；编号映射已在一次运行中观察，但不等于引用结论的语义准确性已通过验收。比如固定边 / 条件边的直接定义在 `[D2]`，答案应优先核对是否引用了这段直接证据。
 - 运行时会重新嵌入文档，并分别执行一次独立诊断检索和一次图内检索；会访问 Embedding 与 Chat API，可能产生费用。`InMemoryVectorStore` 仅在当前进程有效。
 
 ## 项目目标
@@ -129,13 +129,13 @@ LLM API
 - 这些记录证明两次单工具实时天气请求成功，不代表多工具 ReAct 循环、其他城市、异常路径或逐日天气预报已验证。湿度结果与服务端按 0–1 比例格式化的假设相符，但不替代完整 Schema 和边界值检查。地点名“北京市北京”仍有重复，可后续修正展示。
 - 此前输出里的固定“始终晴朗”内容属于旧教学工具，不是实时天气结果。
 
-当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时和审计；RAG 的引用对齐、多问题验收及 BM25 / 混合检索；以及 Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时和审计；RAG 的引用证据准确性审查、多问题验收及 BM25 / 混合检索；以及 Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
 | 文件 | 学习内容 | 当前状态 |
 | --- | --- | --- |
-| [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步向量 RAG：加载、切分、检索、State 传递、生成 | 基础正向链路一次端到端运行（2026-09-27）；引用对齐和多问题验收待完成 |
+| [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步向量 RAG：加载、切分、检索、State 传递、生成 | 基础正向链路已运行；D# 到本次检索片段的映射观察通过一次；引用证据准确性与多问题验收待完成 |
 | [`tools.py`](tools.py) | 共享工具、权限控制、用户资料读写 | 已使用 |
 | [`langgraph_react.py`](langgraph_react.py) | 高层 `create_agent` Agent API | 学习实验，存在待修正缺陷 |
 | [`langgraph_state_react.py`](langgraph_state_react.py) | 显式 StateGraph ReAct 和 ToolNode | 已完成基础实验 |
@@ -320,7 +320,7 @@ Middleware
   -> wrap_model_call 重试 / fallback（可选补充）
   -> Human-in-the-loop edit/respond 与负向 thread_id 验证（可选补充）
   -> MCP 天气 Agent（已验证两次真实天气工具调用和结果回传；其他路径未验证）
-  -> 固定两步向量 RAG happy path 已运行验证；引用对齐、改写问题、跨文档与无答案验收待完成
+  -> 固定两步向量 RAG happy path 和一次 D# 片段映射已运行观察；引用证据准确性、改写问题、跨文档与无答案验收待完成
   -> BM25 / 混合检索
   -> Subgraph / Parallel / Map-Reduce
   -> Supervisor / Multi-Agent
