@@ -4,11 +4,11 @@
 解决的问题：单一检索方式可能漏掉语义相近或关键词精确匹配的片段；混合检索尝试利用两路召回的互补性。
 使用的 Agent 概念：RAG 文档切块、Dense Retrieval、BM25、混合检索、候选 Top-K、RRF。
 系统架构：Markdown -> 共享文本块 -> Dense Top-3 + BM25 Top-3 -> 按 source/start_index 去重并做 RRF -> 融合 Top-3。
-实现方式：Dense 和 BM25 使用同一批文本块；RRF 按名次累加 1 / (rrf_constant + rank)，不比较两种检索器量纲不同的原始分数。
-验证方式：运行本文件，分别查看两路结果、融合排名、各路名次；当前示例针对知识库外的 DeerFlow 问题。
+实现方式：Dense 和 BM25 使用同一批文本块；RRF 按名次累加 1 / (rrf_constant + rank)，不比较两种检索器量纲不同的原始分数；hybrid_retrieve 同时供 langgraph_rag_demo.py 的 retrieve 节点调用。
+验证方式：本文件 main() 独立打印 Dense、BM25、RRF 三组结果；维护者另提供了固定两步 StateGraph 的端到端运行结果，观察到 ToolMessage 问题的 RRF 名次、实际模型上下文和回答引用顺序一致。
 学习总结：RRF 融合的是排名而不是 Dense/BM25 原始分数；两路都靠前的文本块通常会获得更高融合排名。
-已知限制：当前只是独立检索对比脚本，没有编译 StateGraph、没有调用 Chat LLM，也没有拒答阈值；Dense 检索会调用 Embedding API。
-后续优化方向：把融合检索接入固定 RAG 的 retrieve 节点，继续验证引用映射、正向/改写/跨文档/无答案问题，并评估是否需要重排或拒答策略。
+已知限制：本文件的 main() 仍是独立检索对比，不编译 StateGraph、不调用 Chat LLM，也没有拒答阈值；完整的混合 RAG 图位于 langgraph_rag_demo.py。Dense 检索会调用 Embedding API。
+后续优化方向：按需扩大端到端问题集，检查改写、跨文档、引用语义和库外拒答；是否引入重排或持久化向量数据库，留待具体需求驱动。
 """
 
 import jieba
@@ -29,7 +29,7 @@ DOCS_DIR = ROOT / "rag_docs"
 
 
 class RAGState(TypedDict):
-    """预留给后续 StateGraph 集成的共享数据契约；本独立对比脚本当前未实例化图。"""
+    """本独立对比脚本未实例化该 State；实际 Hybrid RAG 图的 State 定义在 langgraph_rag_demo.py。"""
     question: str
     documents: NotRequired[list[Document]]
     answer: NotRequired[str]
@@ -134,10 +134,10 @@ def hybrid_retrieve(
     query: str,
     final_k: int = 3,
 ):
-    """分别执行 Dense/BM25 Top-3 并融合。
+    """分别执行 Dense/BM25 Top-3 并融合，返回按 RRF 排序的文档、分数和各路名次。
 
-    这是供后续 RAG 图调用的便捷函数；当前 main() 会分开保存并打印两路结果，
-    以便观察融合前后的差异，因此没有调用本函数。
+    langgraph_rag_demo.py 的 retrieve 节点调用此函数；本文件 main() 则保留独立
+    的分路打印逻辑，便于对照 Dense、BM25 与融合后的排序差异。
     """
     # Dense 与 BM25 各自产生候选排名；它们原始分数的含义和量纲不同，
     # 所以融合阶段只使用排名，不把原始分数混在一起计算。
@@ -205,7 +205,7 @@ def main() -> None:
         check_embedding_ctx_length=False,
     )
 
-    query = "DeerFlow 使用什么数据库保存长期记忆？"
+    query = "StateGraph 中 State、Node、Edge 分别负责什么？"
 
     documents = load_documents()
     chunks = split_documents(documents)

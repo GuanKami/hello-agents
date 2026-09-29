@@ -6,26 +6,27 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 9 月 28 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter` 并完成真实天气调用；固定两步向量 RAG 正向链路已运行，BM25 独立检索及 Dense + BM25 + RRF 独立对比也已有手动运行观察，但混合检索尚未接入 RAG StateGraph。
+> 截至 2026 年 9 月 29 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter` 并完成真实天气调用；RAG 基础实验已完成固定两步 StateGraph、BM25 单路检索，以及 Dense + BM25 + RRF 混合检索接入和一次端到端正向验证。
 >
-> 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 RAG 输出读取 2 份 Markdown 并切分为 9 个文本块，Top-3 命中 `stategraph.md` 的 `start=0/339/605` 片段，生成上下文中的 `[D1]`、`[D2]`、`[D3]` 与这三段一一对应；目前只验证了一个问题类型，引用是否充分支持每条结论、改写问题、跨文档问题和无答案问题仍待验收。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
+> 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 Hybrid RAG 输出读取 2 份 Markdown 并切分为 9 个文本块。针对 ToolMessage 问题，RRF Top-3 为 `react.md/start=363`（Dense/BM25 均第 1，0.0328）、`react.md/start=0`（均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）；图实际发送给 LLM 的上下文顺序与融合排名一致，答案使用了对应的 `[D1]`、`[D2]`、`[D3]`。这是一条小型语料上的正向端到端验证，不代表系统化检索质量、引用语义或库外拒答评估。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
 ### RAG 基础流程
 
-[`langgraph_rag_demo.py`](langgraph_rag_demo.py) 是固定两步 StateGraph RAG 实验，不是 Agentic RAG：
+[`langgraph_rag_demo.py`](langgraph_rag_demo.py) 是固定两步 Hybrid RAG StateGraph 实验，不是 Agentic RAG：
 
 ```text
-本地 Markdown -> 文档切块 -> Embedding / InMemoryVectorStore
-    -> retrieve 节点写入 RAGState.documents
+本地 Markdown -> 文档切块 -> Dense 向量索引 + BM25 关键词索引
+    -> retrieve 节点：Dense Top-3 + BM25 Top-3 -> RRF Top-3
+    -> 将融合排序后的 Document 写入 RAGState.documents
     -> generate 节点显式构造模型上下文并生成答案
 ```
 
 - 知识库位于 [`rag_docs/`](rag_docs/)；目前包括 `react.md` 和 `stategraph.md`。
 - `RecursiveCharacterTextSplitter` 使用 `chunk_size=400`、`chunk_overlap=80`，并记录 `start_index`，便于回看文本块在原文中的位置。
-- 图内的 `retrieve` 节点从向量库取 Top-3 文档，`generate` 节点将问题和证据片段组装为消息。文档保存在 State 中并不意味着 LangGraph 会自动把它们传给 LLM。
-- 维护者提供的正向运行结果显示：2 份原始文档切为 9 个片段；“StateGraph 中 State、Node、Edge 分别负责什么？”召回 3 个 `stategraph.md` 片段，最新一次分数为 `0.7994`、`0.7792`、`0.7161`，随后完成生成并在 State 中保留召回文档。另一次结果的分数略有不同，排名相同；这类分数只用于观察本次检索排序，不是答案正确率或概率。
-- 当前固定的 `retrieve -> generate` happy path 已跑通。生成上下文现在为片段附加临时编号：本次 `[D1]` 对应 `start=0`、`[D2]` 对应 `start=339`、`[D3]` 对应 `start=605`，因此回答引用可以定位回本次检索到的片段。编号会随检索结果和排序变化，不是稳定文档 ID；编号映射已在一次运行中观察，但不等于引用结论的语义准确性已通过验收。比如固定边 / 条件边的直接定义在 `[D2]`，答案应优先核对是否引用了这段直接证据。
-- 运行时会重新嵌入文档，并分别执行一次独立诊断检索和一次图内检索；会访问 Embedding 与 Chat API，可能产生费用。`InMemoryVectorStore` 仅在当前进程有效。
+- 图内 `retrieve` 节点通过 `hybrid_retrieve()` 取 Dense 与 BM25 两路 Top-3，再由 RRF 排序；`generate` 节点将问题和融合后的证据片段组装为消息。文档保存在 State 中并不意味着 LangGraph 会自动把它们传给 LLM。
+- 维护者提供的端到端结果读取 2 份原始文档并切成 9 个片段。针对“ReAct 中 ToolMessage 代表什么？工具返回后 Agent 如何继续？”，RRF 排名依次为 `react.md/start=363`（两路均第 1，0.0328）、`react.md/start=0`（两路均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）。输出显示图实际发送给 LLM 的上下文与该顺序相同，生成答案使用了对应编号。
+- `[D1]`、`[D2]`、`[D3]` 是按本次 RRF 最终顺序临时分配的编号，可定位回当前上下文片段，但不是稳定文档 ID，也不自动证明引用内容直接支持结论。该运行验证的是一条正向路径；更广的问题集与引用语义评估仍可后续补充。
+- 运行时会重新嵌入文档，并分别执行一次独立 Dense 诊断检索和一次图内混合检索；因此会重复计算一次查询向量并产生额外 Embedding 请求。还会调用 Chat API，可能产生费用。`InMemoryVectorStore` 仅在当前进程有效。
 
 ### BM25 与混合检索实验
 
@@ -42,9 +43,9 @@ langgraph_hybrid_rag_demo.py:
 
 - BM25 是词项检索，不需要 Embedding；当前独立脚本只加载本地资料、分词、排序和打印结果，不调用 LLM 或 Embedding API。
 - 混合检索使用 Reciprocal Rank Fusion（RRF）融合两路排名，不把向量相似度分数和 BM25 分数直接相加。脚本会打印每个融合结果在 Dense 与 BM25 中各自的名次，方便追踪排名来源。
-- 目前是检索对比原型，不是完整 RAG 工作流：`langgraph_hybrid_rag_demo.py` 尚未接入 `langgraph_rag_demo.py` 的 `retrieve` 节点，也不生成答案。Dense 路径访问 Embedding API，运行可能产生费用。
-- 手动运行中，BM25 的 3 个库内问题找到了相关片段；混合检索的 ReAct ToolMessage 和 StateGraph 改写问题也观察到相关候选。询问知识库未覆盖的 DeerFlow 长期记忆数据库时，BM25 和 RRF 仍会返回无关 Top-K 候选。**Top-K / RRF 只负责排序，不等于确认知识库存在答案，也不会自动拒答。**
-- 混合检索原始 StateGraph 核心问题的结果尚待补充；小型语料上的手动观察不等于系统评估。下一步应先补该查询，再决定是否将 RRF 接入固定 RAG 图，并继续验收引用证据、改写问法、跨文档和无答案处理。
+- `langgraph_hybrid_rag_demo.py` 的独立入口用于分别查看 Dense、BM25 和 RRF；其中 `hybrid_retrieve()` 已被 `langgraph_rag_demo.py` 的 `retrieve` 节点调用，完成了固定两步 Hybrid RAG 集成。独立对比脚本不生成答案，完整生成流程由 RAG StateGraph 执行。
+- 手动运行中，BM25 的 3 个库内问题找到了相关片段；混合检索的多个独立查询也观察到两路候选。集成图目前有 ToolMessage 问题的一条端到端正向结果。询问知识库未覆盖的 DeerFlow 长期记忆数据库时，BM25 和 RRF 仍会返回无关 Top-K 候选。**Top-K / RRF 只负责排序，不等于确认知识库存在答案，也不会自动拒答。**
+- RAG 基础里程碑已完成；扩展改写问法、跨文档、引用语义和库外拒答评估属于后续质量改进。当前小型语料与手动样例不构成系统评测，也没有持久化向量库、相关性阈值或重排器。
 
 ## 项目目标
 
@@ -148,15 +149,15 @@ LLM API
 - 这些记录证明两次单工具实时天气请求成功，不代表多工具 ReAct 循环、其他城市、异常路径或逐日天气预报已验证。湿度结果与服务端按 0–1 比例格式化的假设相符，但不替代完整 Schema 和边界值检查。地点名“北京市北京”仍有重复，可后续修正展示。
 - 此前输出里的固定“始终晴朗”内容属于旧教学工具，不是实时天气结果。
 
-当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时和审计；RAG 的引用证据准确性与多问题验收、BM25/RRF 接入固定 StateGraph 及拒答策略；以及 Subgraph、并行和 Multi-Agent。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时和审计；RAG 更大规模的引用语义与多问题评估、库外拒答策略；以及 Subgraph、并行和 Multi-Agent。RAG 基础链路及 Dense + BM25 + RRF 图集成已完成一次端到端正向验证。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
 | 文件 | 学习内容 | 当前状态 |
 | --- | --- | --- |
-| [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步向量 RAG：加载、切分、检索、State 传递、生成 | 基础正向链路已运行；D# 到本次检索片段的映射观察通过一次；引用证据准确性与多问题验收待完成 |
-| [`langgraph_bm25_demo.py`](langgraph_bm25_demo.py) | jieba 中文分词与 BM25 关键词 Top-K 检索 | 3 个知识库内查询命中相关片段；库外问题仍返回候选；未接入 Agent/RAG 图 |
-| [`langgraph_hybrid_rag_demo.py`](langgraph_hybrid_rag_demo.py) | Dense + BM25 + RRF 排名融合对比 | 3 个场景已手动观察；原始 StateGraph 问题待补，尚未接入 RAG 图或生成答案 |
+| [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步 Hybrid RAG：Dense + BM25 + RRF、State 传递和带引用生成 | 已完成一次端到端正向运行，图内 RRF 名次与模型上下文/D# 顺序一致；更广评测与库外拒答待后续补充 |
+| [`langgraph_bm25_demo.py`](langgraph_bm25_demo.py) | jieba 中文分词与 BM25 关键词 Top-K 检索 | 独立单路基线；3 个库内查询命中相关片段，库外问题仍返回候选 |
+| [`langgraph_hybrid_rag_demo.py`](langgraph_hybrid_rag_demo.py) | Dense + BM25 + RRF 排名融合与可复用 helper | 独立对比入口已验证；`hybrid_retrieve()` 已集成到 RAG StateGraph |
 | [`tools.py`](tools.py) | 共享工具、权限控制、用户资料读写 | 已使用 |
 | [`langgraph_react.py`](langgraph_react.py) | 高层 `create_agent` Agent API | 学习实验，存在待修正缺陷 |
 | [`langgraph_state_react.py`](langgraph_state_react.py) | 显式 StateGraph ReAct 和 ToolNode | 已完成基础实验 |
@@ -197,9 +198,9 @@ hello-agents/
 ├── langgraph_human_in_the_loop_demo.py          # Human-in-the-loop 审批
 ├── langgraph_human_in_the_loop_sqlite_demo.py   # SqliteSaver 跨进程 HITL
 ├── langgraph_mcp_demo.py                        # MCPAdapter + Agent
-├── langgraph_rag_demo.py                        # 固定 retrieve -> generate RAG 图
+├── langgraph_rag_demo.py                        # 固定两步 Hybrid RAG 图（Dense + BM25 + RRF）
 ├── langgraph_bm25_demo.py                       # 中文 BM25 关键词检索
-├── langgraph_hybrid_rag_demo.py                 # Dense + BM25 + RRF 对比原型
+├── langgraph_hybrid_rag_demo.py                 # Dense + BM25 + RRF 对比和检索 helper
 ├── rag_docs/
 │   ├── react.md                                  # RAG 知识库样例
 │   └── stategraph.md                             # RAG 知识库样例
@@ -347,9 +348,8 @@ Middleware
   -> wrap_model_call 重试 / fallback（可选补充）
   -> Human-in-the-loop edit/respond 与负向 thread_id 验证（可选补充）
   -> MCP 天气 Agent（已验证两次真实天气工具调用和结果回传；其他路径未验证）
-  -> 固定两步向量 RAG happy path 和一次 D# 片段映射已运行观察；引用证据准确性、改写问题、跨文档与无答案验收待完成
-  -> 独立 BM25 已运行观察；Dense + BM25 + RRF 已有三个场景的独立对比结果
-  -> 补跑原始 StateGraph 问题，并评估是否把混合检索接入固定 RAG 图；继续设计无答案拒答策略
+  -> 固定两步 Hybrid RAG 已接入并完成一次端到端正向运行，RRF 名次、模型上下文和 D# 映射一致
+  -> 扩大改写问题、跨文档、引用语义及库外拒答评估（后续质量改进，不阻塞主线）
   -> Subgraph / Parallel / Map-Reduce
   -> Supervisor / Multi-Agent
   -> Evaluation / Observability

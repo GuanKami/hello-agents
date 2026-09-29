@@ -1,14 +1,14 @@
 """
-实验名称：使用 LangGraph StateGraph 实现固定两步向量 RAG
-实验目标：跑通本地 Markdown 文档从加载、切分、向量索引、检索到基于证据生成回答的完整链路。
-解决的问题：聊天模型本身不会自动读取本地资料；RAG 在生成前先检索相关片段，再把片段显式加入模型上下文。
-使用的 Agent 概念：Document 与 metadata、RecursiveCharacterTextSplitter、Embedding、InMemoryVectorStore、State、节点和固定边。
-系统架构：START -> retrieve -> generate -> END；State 在两个节点间传递用户问题和召回文档。
-实现方式：加载 rag_docs/*.md，保留来源 metadata；按字符切块并生成向量；retrieve 节点召回 Top-K；generate 节点显式拼接证据并调用聊天模型。
-验证方式：维护者提供了端到端运行结果：2 份文档切为 9 个片段，召回 3 个 stategraph.md 片段；最新输出中的 [D1]、[D2]、[D3] 分别对应 start=0、339、605 的上下文片段，答案使用了这些编号。当前只覆盖一个正向问题，尚未系统验收每条引用是否充分支持对应结论。
-学习总结：切块和检索结果应先独立检查；State 中保存 Document 不会自动把它们传给 LLM，生成节点必须主动构造上下文。
-已知限制：InMemoryVectorStore 不持久化；目前只验证了一个问题类型。D# 编号只在本次检索结果中按顺序临时分配，不是稳定文档 ID；提示词允许列表也不等于程序化引用校验。当前答案对 Edge 的固定边 / 条件边解释可以更直接引用 start=339 的片段，引用的语义准确性仍需人工审查和更多问题验证。
-后续优化方向：补充改写问题、另一文档问题和无答案问题，逐条核对结论与引用片段；之后比较 BM25 与混合检索。当前完成的是固定向量 RAG 基础链路，不代表完整 RAG 章节或生产级引用校验已完成。
+实验名称：使用 LangGraph StateGraph 实现固定两步 Hybrid RAG
+实验目标：跑通本地 Markdown 文档从加载、切分、Dense/BM25 混合检索、RRF 排序到基于证据生成回答的完整链路。
+解决的问题：聊天模型不会自动读取本地资料；Dense 与 BM25 各自召回候选，RRF 按排名融合后，将最终证据显式放入模型上下文。
+使用的 Agent 概念：Document 与 metadata、RecursiveCharacterTextSplitter、Embedding、InMemoryVectorStore、jieba、BM25、RRF、State、节点和固定边。
+系统架构：rag_docs -> chunks -> Dense Top-3 + BM25 Top-3 -> RRF Top-3 -> START -> retrieve -> generate -> END；State 在两个节点间传递问题与融合后的文档。
+实现方式：加载 rag_docs/*.md 并保留来源 metadata；对共享 chunks 建立 Dense 与 BM25 索引；retrieve 节点调用 hybrid_retrieve 并记录各路排名；generate 节点显式拼接证据、临时编号并调用聊天模型。
+验证方式：维护者提供了端到端运行结果：2 份文档切为 9 个片段。针对“ReAct 中 ToolMessage 代表什么？工具返回后 Agent 如何继续？”，RRF Top-1 为 react.md start=363（Dense/BM25 均第 1，分数 0.0328），Top-2 为 react.md start=0（均第 2，分数 0.0323），Top-3 为 stategraph.md start=605（Dense 第 3，BM25 未命中，分数 0.0159）；实际发送给 LLM 的上下文与该顺序一致，回答使用了对应的 [D1]、[D2]、[D3] 编号。
+学习总结：Dense 擅长语义相似召回，BM25 擅长词项匹配；RRF 融合排名而非两种检索器量纲不同的原始分数。State 中保存 Document 不会自动把它们传给 LLM，生成节点必须主动构造上下文。
+已知限制：InMemoryVectorStore 不持久化；当前只有小型本地语料和有限的端到端问题验证。D# 编号只在本次检索结果中临时分配，不是稳定文档 ID；提示词允许列表不等于程序化引用校验。Top-K/RRF 不判断知识库是否包含答案，也不会自动拒答。
+后续优化方向：按需补充改写问法、跨文档问题、库外拒答和引用语义评估；重排、拒答阈值及持久化向量数据库作为后续工程化方向，不属于本次基础实验验收范围。
 """
 
 import os
@@ -22,6 +22,8 @@ from langchain_core.vectorstores import InMemoryVectorStore
 from langgraph.graph import END, START, StateGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.messages import HumanMessage, SystemMessage
+
+from langgraph_hybrid_rag_demo import build_bm25, hybrid_retrieve
 
 ROOT = Path(__file__).resolve().parent
 # 使用脚本所在目录定位资料，避免运行时依赖当前 PowerShell 工作目录。
@@ -51,7 +53,7 @@ class RAGState(TypedDict):
     documents: NotRequired[list[Document]]
     answer: NotRequired[str]
 
-def build_graph(vector_store, llm):
+def build_graph(vector_store, llm, bm25, chunks):
     """
     创建两步 RAG 状态图：
 
@@ -60,15 +62,34 @@ def build_graph(vector_store, llm):
       -> generate：把问题和文档交给 LLM 生成答案
       -> END
 
+    vector_store 负责 Dense 召回，bm25 与 chunks 负责关键词召回并还原 Document。
+    两路使用同一批 chunks，保证融合时的切块和去重标识一致。
     与 ReAct 不同，这里没有让模型选择是否检索的条件路由；每个输入都会先检索，再生成。
     """
 
     def retrieve_node(state: RAGState):
-        """只负责向量召回 Top-3；返回的字段更新由 StateGraph 合并进共享 State。"""
-        documents = vector_store.similarity_search(
-            state["question"],
-            k=3,
+        """执行 Dense 与 BM25 双路 Top-3 召回，经 RRF 排序后将最终 Document 列表写入 State。"""
+        ranked_results = hybrid_retrieve(
+            vector_store=vector_store,
+            bm25=bm25,
+            chunks=chunks,
+            query=state["question"],
+            final_k=3,
         )
+
+        for rank, (doc, rrf_score, ranks) in enumerate(ranked_results, start=1):
+            print(
+                f"[RRF Top {rank}] "
+                f"source={doc.metadata.get('source')}, "
+                f"start={doc.metadata.get('start_index')}, "
+                f"score={rrf_score:.4f}, "
+                f"ranks={ranks}"
+            )
+
+        # hybrid_retrieve 返回 (Document, RRF分数, 各路排名)。
+        # State 和后续 generate_node 只需要按最终融合顺序排列的 Document。
+        documents = [document for document, _score, _ranks in ranked_results]
+
         return {"documents": documents}
 
     def generate_node(state: RAGState):
@@ -183,6 +204,9 @@ def main() -> None:
     chunks = splitter.split_documents(documents)
     print(f"切分后的文档片段数量：{len(chunks)}")
 
+    # 关键词索引与下面的向量库共用同一批 chunks，方便 RRF 按来源和起始位置合并同一片段。
+    bm25 = build_bm25(chunks)
+
     # InMemoryVectorStore 适合观察检索机制；索引仅在本进程中存在，脚本退出后不会保留。
     vector_store = InMemoryVectorStore(
         embedding=embeddings,
@@ -210,6 +234,8 @@ def main() -> None:
     graph = build_graph(
         vector_store=vector_store,
         llm=llm,
+        bm25=bm25,
+        chunks=chunks,
     )
 
     # invoke 才会真正按 START -> retrieve -> generate -> END 执行编译后的 StateGraph。
@@ -234,6 +260,5 @@ def main() -> None:
     print("\n=== StateGraph Mermaid 源码 ===")
     print(graph.get_graph().draw_mermaid())
     
-
 if __name__ == "__main__":
     main()
