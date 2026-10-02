@@ -6,7 +6,7 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 9 月 29 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter` 并完成真实天气调用；RAG 基础实验已完成固定两步 StateGraph、BM25 单路检索，以及 Dense + BM25 + RRF 混合检索接入和一次端到端正向验证。
+> 截至 2026 年 10 月 2 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter` 并完成真实天气调用；固定两步 Hybrid RAG 已完成一次端到端正向验证；Agentic RAG 第一版已运行观察“检索回答”和“直接回答”两个分支。
 >
 > 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 Hybrid RAG 输出读取 2 份 Markdown 并切分为 9 个文本块。针对 ToolMessage 问题，RRF Top-3 为 `react.md/start=363`（Dense/BM25 均第 1，0.0328）、`react.md/start=0`（均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）；图实际发送给 LLM 的上下文顺序与融合排名一致，答案使用了对应的 `[D1]`、`[D2]`、`[D3]`。这是一条小型语料上的正向端到端验证，不代表系统化检索质量、引用语义或库外拒答评估。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
@@ -47,6 +47,22 @@ langgraph_hybrid_rag_demo.py:
 - 手动运行中，BM25 的 3 个库内问题找到了相关片段；混合检索的多个独立查询也观察到两路候选。集成图目前有 ToolMessage 问题的一条端到端正向结果。询问知识库未覆盖的 DeerFlow 长期记忆数据库时，BM25 和 RRF 仍会返回无关 Top-K 候选。**Top-K / RRF 只负责排序，不等于确认知识库存在答案，也不会自动拒答。**
 - RAG 基础里程碑已完成；扩展改写问法、跨文档、引用语义和库外拒答评估属于后续质量改进。当前小型语料与手动样例不构成系统评测，也没有持久化向量库、相关性阈值或重排器。
 
+### Agentic RAG 第一版
+
+[`langgraph_agentic_rag_demo.py`](langgraph_agentic_rag_demo.py) 在固定两步 Hybrid RAG 前面增加 `decide` 规划节点，让模型先结构化地选择“检索本地知识库”或“直接回答”：
+
+```text
+START -> decide -> direct -> direct_answer -> END
+                 └ retrieve -> Hybrid(Dense + BM25 + RRF) -> grounded_generate -> END
+```
+
+- `RetrievalPlan` 限定规划输出为 `action` 与 `query`。模型提出动作意图；真正的流程仍由 Python 条件边在预先注册的两个分支中选择。
+- `retrieve` 分支复用 `langgraph_hybrid_rag_demo.py` 的 `hybrid_retrieve()`，并由 `grounded_generate` 显式将问题和召回片段放入模型上下文。
+- `direct` 分支运行时绕过检索节点，直接回答一般问候，不声称依据本地资料作答；不过当前 `main()` 会在 `invoke()` 前统一加载语料并建立向量索引，因此该分支仍承担启动阶段的索引构建成本。
+- 维护者提供的真实模型结果分别观察到知识库问题选择 `retrieve`、问候“你好”选择 `direct`。这是两个分支的手动功能观察，不是准确率评估。
+- 当前没有证据充分性判断、查询改写、重试、拒答节点或引用语义校验。`EvidenceReview` 和相关 State 字段仅为后续实验预留；代码还没有把它们接入图。知识库外问题仍可能被误判为需要检索，或者检索到无关候选。
+- 运行时会调用 Embedding API 和 Chat API；向量索引使用 `InMemoryVectorStore`，每次进程启动后重新建立，不提供持久化。
+
 ## 项目目标
 
 长期目标是：
@@ -79,7 +95,7 @@ LLM API
   -> StateGraph 与工作流
   -> Memory / Context Engineering
   -> Middleware / Human-in-the-loop
-  -> MCP / RAG / Subgraph / Multi-Agent
+  -> MCP / Hybrid RAG / Agentic RAG / Subgraph / Multi-Agent
   -> Evaluation / Observability / Production
   -> DeerFlow 源码与架构学习
   -> RepoResearcher 简历项目
@@ -149,7 +165,7 @@ LLM API
 - 这些记录证明两次单工具实时天气请求成功，不代表多工具 ReAct 循环、其他城市、异常路径或逐日天气预报已验证。湿度结果与服务端按 0–1 比例格式化的假设相符，但不替代完整 Schema 和边界值检查。地点名“北京市北京”仍有重复，可后续修正展示。
 - 此前输出里的固定“始终晴朗”内容属于旧教学工具，不是实时天气结果。
 
-当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时和审计；RAG 更大规模的引用语义与多问题评估、库外拒答策略；以及 Subgraph、并行和 Multi-Agent。RAG 基础链路及 Dense + BM25 + RRF 图集成已完成一次端到端正向验证。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时和审计；Agentic RAG 的证据充分性判断、查询改写、有界重试与拒答，以及更大规模的引用语义和多问题评估；还有 Subgraph、并行和 Multi-Agent。Agentic RAG 当前仅完成 direct / retrieve 两路由的运行观察，不应表述为完整的 Agentic / Corrective RAG。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
@@ -158,6 +174,7 @@ LLM API
 | [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步 Hybrid RAG：Dense + BM25 + RRF、State 传递和带引用生成 | 已完成一次端到端正向运行，图内 RRF 名次与模型上下文/D# 顺序一致；更广评测与库外拒答待后续补充 |
 | [`langgraph_bm25_demo.py`](langgraph_bm25_demo.py) | jieba 中文分词与 BM25 关键词 Top-K 检索 | 独立单路基线；3 个库内查询命中相关片段，库外问题仍返回候选 |
 | [`langgraph_hybrid_rag_demo.py`](langgraph_hybrid_rag_demo.py) | Dense + BM25 + RRF 排名融合与可复用 helper | 独立对比入口已验证；`hybrid_retrieve()` 已集成到 RAG StateGraph |
+| [`langgraph_agentic_rag_demo.py`](langgraph_agentic_rag_demo.py) | 规划模型选择 direct / retrieve；检索分支复用 Hybrid RAG | 两条分支均有真实模型运行观察；证据评估、查询改写、重试和拒答尚未实现 |
 | [`tools.py`](tools.py) | 共享工具、权限控制、用户资料读写 | 已使用 |
 | [`langgraph_react.py`](langgraph_react.py) | 高层 `create_agent` Agent API | 学习实验，存在待修正缺陷 |
 | [`langgraph_state_react.py`](langgraph_state_react.py) | 显式 StateGraph ReAct 和 ToolNode | 已完成基础实验 |
@@ -201,6 +218,7 @@ hello-agents/
 ├── langgraph_rag_demo.py                        # 固定两步 Hybrid RAG 图（Dense + BM25 + RRF）
 ├── langgraph_bm25_demo.py                       # 中文 BM25 关键词检索
 ├── langgraph_hybrid_rag_demo.py                 # Dense + BM25 + RRF 对比和检索 helper
+├── langgraph_agentic_rag_demo.py                # Agentic RAG 第一版：direct / retrieve 路由
 ├── rag_docs/
 │   ├── react.md                                  # RAG 知识库样例
 │   └── stategraph.md                             # RAG 知识库样例
@@ -273,6 +291,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe langgraph_rag_demo.py
 .\.venv\Scripts\python.exe langgraph_bm25_demo.py
 .\.venv\Scripts\python.exe langgraph_hybrid_rag_demo.py
+.\.venv\Scripts\python.exe langgraph_agentic_rag_demo.py
 .\.venv\Scripts\python.exe langgraph_context_demo.py
 .\.venv\Scripts\python.exe langgraph_state_context_demo.py
 .\.venv\Scripts\python.exe langgraph_middleware_dynamic_prompt_demo.py
@@ -292,7 +311,7 @@ python -m venv .venv
 语法检查可以使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
 MCP 命令会启动本地 stdio Server，并请求真实天气 API 和 LLM；可能产生外部请求或费用。运行前需要在根目录 `.env` 配置 `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`QWEATHER_API_HOST` 和 `QWEATHER_API_KEY`。模型、Embedding、搜索和天气工具都可能访问外部 API；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
@@ -349,7 +368,8 @@ Middleware
   -> Human-in-the-loop edit/respond 与负向 thread_id 验证（可选补充）
   -> MCP 天气 Agent（已验证两次真实天气工具调用和结果回传；其他路径未验证）
   -> 固定两步 Hybrid RAG 已接入并完成一次端到端正向运行，RRF 名次、模型上下文和 D# 映射一致
-  -> 扩大改写问题、跨文档、引用语义及库外拒答评估（后续质量改进，不阻塞主线）
+  -> Agentic RAG 第一版：direct / retrieve 两分支已观察；证据评估与有界重试待实现
+  -> 固定两步 RAG 的改写问法、跨文档、引用语义及库外拒答扩展评测（可选质量改进）
   -> Subgraph / Parallel / Map-Reduce
   -> Supervisor / Multi-Agent
   -> Evaluation / Observability

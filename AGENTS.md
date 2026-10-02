@@ -23,7 +23,7 @@ LLM API
   -> StateGraph 与工作流
   -> Memory / Context Engineering
   -> Middleware / Human-in-the-loop
-  -> MCP / RAG / Subgraph / Multi-Agent
+  -> MCP / Hybrid RAG / Agentic RAG / Subgraph / Multi-Agent
   -> Evaluation / Observability / Production
   -> DeerFlow 源码与架构学习
 ```
@@ -77,6 +77,7 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_rag_demo.py                               # 固定两步 Hybrid RAG：Dense + BM25 + RRF -> retrieve -> generate
 ├── langgraph_bm25_demo.py                              # 独立中文 BM25 Top-K 关键词检索
 ├── langgraph_hybrid_rag_demo.py                        # Dense + BM25 + RRF 对比；向 RAG 图提供融合检索函数
+├── langgraph_agentic_rag_demo.py                       # Agentic RAG 第一版：模型选择 direct / retrieve
 ├── rag_docs/                                            # RAG 实验用的本地 Markdown 知识库
 │   ├── react.md
 │   └── stategraph.md
@@ -925,6 +926,36 @@ rag_docs/*.md
 - 独立检索运行已观察 ReAct ToolMessage、StateGraph 问题和 DeerFlow 库外问题等场景；库外问题仍会得到无关 Top-K 候选，说明 RRF 不负责拒答。
 - 图级验证详见 4.19：维护者提供了 ToolMessage 问题的端到端排名、实际上下文和引用输出。小型教学语料和少量手动问题不构成系统质量评估。
 
+### 4.22 Agentic RAG 第一版：`langgraph_agentic_rag_demo.py`
+
+该实验在固定两步 Hybrid RAG 前加入规划节点，由模型决定走“直接回答”还是“检索后基于证据回答”。目前范围仅为这两条分支，不代表完整的 Agentic / Corrective RAG 系统。
+
+```text
+START -> decide -- direct --> direct_answer -> END
+                 └ retrieve -> retrieve -> grounded_generate -> END
+```
+
+执行职责与数据流：
+
+- `RetrievalPlan` 通过 `with_structured_output(..., include_raw=True)` 将规划结果约束为 `action` 与 `query`；原始模型响应和解析错误会被打印，方便诊断结构化输出兼容性问题。
+- `decide_node` 只负责规划并把 `action`、`search_query` 写入 State。模型提出路由意图，`route_after_decide` 与条件边根据允许值选择已注册的节点；模型不会自行创建或修改图结构。
+- `retrieve_node` 将规划查询传给 `langgraph_hybrid_rag_demo.py` 的 `hybrid_retrieve()`，复用 Dense + BM25 + RRF，再将按融合名次排列的 `Document` 写入 State。
+- `direct_answer_node` 在图运行时不执行检索节点，适用于一般问候等不依赖知识库的问题，并要求模型不要声称查过本地资料。注意 `main()` 会在 `invoke()` 前统一加载语料并构建向量索引，所以 direct 仅跳过查询，不跳过启动索引成本。
+- `grounded_generate_node` 从 State 取回问题和文档，显式组装模型消息。State 中的文档不会自动进入 LLM 上下文。`[D1]` 等编号只在本次上下文中按检索顺序临时分配；提示词要求引用不能替代引用语义的程序化核验。
+- `EvidenceReview`、`sufficient` 和 `retry_query` 是后续证据评估 / 查询改写实验的预留定义，目前没有节点读取或写入它们，也没有重试循环。
+- `retrieval_count` 当前只记录实际执行的检索次数；在目前无循环拓扑中，retrieve 分支正常只检索一次。
+- 语料沿用 `rag_docs/*.md` 与现有切块 helper。向量检索使用 `InMemoryVectorStore`，每次运行重建索引；脚本真实运行会调用 Embedding API 和 Chat API，可能产生费用。
+- `graph.get_graph().draw_mermaid()` 只输出静态拓扑；`graph.invoke()` 才实际运行规划、路由、检索和回答节点。
+
+维护者提供的真实模型输出观察到两条路径：
+
+```text
+知识库问题 -> action=retrieve -> Dense/BM25/RRF -> grounded_generate
+“你好”    -> action=direct   -> direct_answer（未进入检索节点）
+```
+
+这验证的是两种预期输入下的路径可达性，不是模型路由准确率或检索质量评测。当前尚未验证知识库外问题拒答、规划误判后的恢复、证据充分性判断、查询改写、有界重试、跨文档问题、引用语义和自动评估。
+
 ## 5. 学习进度和路线（Learning Roadmap）
 
 ### 5.1 已完成
@@ -948,6 +979,7 @@ rag_docs/*.md
 - RAG 检索观察：Dense 与 BM25 分别召回 Top-3，RRF 按排名融合；已观察分数、各路名次和最终文档顺序。分数不是正确率，少量手动运行不构成跨问题评估。
 - BM25 中文关键词检索（`langgraph_bm25_demo.py`）：3 个知识库内问题检索到相关片段；知识库外 DeerFlow 问题仍返回无关 Top-K，说明 BM25 本身不负责拒答。
 - Dense + BM25 + RRF（`langgraph_hybrid_rag_demo.py`）：独立对比入口仍可观察两路候选及融合排名；`hybrid_retrieve()` 已由固定 RAG 图调用。集成图的 ToolMessage 问题 RRF 名次已验证：react.md start=363（Dense/BM25 均第 1，0.0328）、react.md start=0（均第 2，0.0323）、stategraph.md start=605（Dense 第 3、BM25 未命中，0.0159）。库外问题仍会返回候选。
+- **Agentic RAG 第一版（`langgraph_agentic_rag_demo.py`）**：已由维护者提供的运行结果观察知识库问题走 `retrieve`、一般问候“你好”走 `direct`；检索分支复用 Dense + BM25 + RRF，direct 分支不检索。当前只验证两种输入下的图分支，没有证据充分性评估、查询改写、重试、拒答节点或路由准确率评估；`EvidenceReview` 和相关 State 字段尚未接入。
 - `InMemoryStore` 的进程生命周期限制。
 - **`SqliteStore` 持久化（课程 Notebook 形式，2026-09-10 维护者确认已完成）**：在 `dive-into-langgraph/6.context.ipynb` 第三节中，用 `sqlite3.connect("user-info.db", check_same_thread=False, isolation_level=None)` 建连接，交给 `SqliteStore(conn)` 作为 Store 后端，用 `store.put(("user_info",), key, value)` 预置资料，再在工具内用 `runtime.store.get(("user_info",), user_id)` 读取。已掌握"**Store 后端可替换、长期资料的生命周期由后端决定**"这一机制。
 
@@ -978,8 +1010,10 @@ rag_docs/*.md
 状态图
 记忆
 上下文
-RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成；课程中的 Agentic Hybrid Search 等拓展未纳入本阶段）
+RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
 ```
+
+另：仓库自行实现的 Agentic RAG 第一版（`langgraph_agentic_rag_demo.py`）已观察 direct / retrieve 两个分支；这不代表课程中的 Agentic Hybrid Search 拓展章节已完成，证据评估与查询改写也尚未实现。
 
 后续不应重复堆叠同一种用户资料读写 Demo，而应转向跨组件设计和 Agent 工程能力。
 
@@ -997,6 +1031,7 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成；课程�
        -> 固定两步 Hybrid RAG 已接入并端到端运行；ToolMessage 问题的 Dense/BM25 名次、RRF 顺序、模型上下文和 D# 回指已观察（截至 2026-09-29）
        -> BM25 独立检索已运行：3 个库内问题召回相关片段，1 个库外问题仍返回候选
        -> Dense + BM25 + RRF 独立对比已在多个场景运行；融合 helper 已复用到 RAG 图
+       -> Agentic RAG 第一版已运行观察 direct / retrieve 两分支；证据评估与查询改写未实现
 ```
 
 **SqliteStore 这一项的结论（2026-09-10 维护者确认，原"顺序偏离"记录作废）**：
@@ -1007,7 +1042,7 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成；课程�
 - 将来若需要根目录级别的跨进程长期记忆（例如 HITL 恢复实验，或简历项目要真的记住用户资料），**四个实验都通过 `build_store()` 单点注入 Store**，改这一处即可，不需要重写实验。
 - 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
-当前 RAG 基础学习里程碑已完成：固定两步 StateGraph 已使用 Dense + BM25 + RRF，且 ToolMessage 问题的融合名次、实际模型上下文和 D# 顺序已由维护者运行观察。当前证据只覆盖小型语料和有限的集成查询；扩展改写问法、跨文档、引用语义与库外拒答评估可作为后续质量改进，不阻塞进入 Parallelization / Subgraph / Map-Reduce。尤其要明确：Top-K 和 RRF 只排序候选，不会自动识别知识库外问题。Middleware 重试、HITL 错误 `thread_id`、`edit/respond` 等属于可选补充，不阻塞主线。MCP 天气实验仍只验证过两次北京单工具实时查询，其他城市、逐日预报和异常路径未覆盖。
+固定两步 Hybrid RAG 基础里程碑已完成一次端到端正向运行；Agentic RAG 当前完成第一版 direct / retrieve 两分支观察。下一步应在此脚本中学习“检索证据是否足够回答”的评估，再讨论如何通过有限次数的查询改写和重试恢复；不要将 `EvidenceReview` 或预留 State 字段误写成已实现功能。Top-K 和 RRF 只排序候选，不会自动识别知识库外问题。小型语料和少量手动输出也不能证明路由、证据充分性或引用语义具备稳定准确率。Middleware 重试、HITL 错误 `thread_id`、`edit/respond` 等属于可选补充，不阻塞主线。MCP 天气实验仍只验证过两次北京单工具实时查询，其他城市、逐日预报和异常路径未覆盖。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -1034,14 +1069,16 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成；课程�
    -> 独立 BM25 中文关键词检索 [已运行观察]
    -> Dense + BM25 + RRF 对比 [已运行观察]
    -> 将混合检索接入固定 RAG StateGraph，并验证一次端到端正向问题及 RRF 名次 [已完成]
-   -> 扩大改写问法、跨文档、引用语义和库外拒答评估 [后续质量改进，不阻塞进入下一阶段]
+   -> Agentic RAG direct / retrieve 两分支 [已观察]
+   -> 证据充分性评估节点 [下一步]
+   -> 有界查询改写 / 重试、知识库外拒答与引用评估 [待实现和验证]
 7. Parallelization / Subgraph / Map-Reduce
 8. Supervisor / Multi-Agent
 9. Evaluation / Observability / Cost / Failure Analysis
 10. Production Architecture 和 DeerFlow 源码阅读
 ```
 
-第 1 步已完成（课程 Notebook 形式），见 5.1 / 5.2 节。当前**不存在未处理的顺序偏离项**；RAG 的实际推进状态见 4.19–4.21 节。
+第 1 步已完成（课程 Notebook 形式），见 5.1 / 5.2 节。当前**不存在未处理的顺序偏离项**；RAG 与 Agentic RAG 的实际推进状态见 4.19–4.22 节。
 
 Middleware 放在 Context Engineering 之后，因为中间件经常需要读取和修改 State、Runtime、Prompt、Model 或 Tool 行为。Human-in-the-loop 放在 Middleware 之后，因为中断和恢复依赖可靠的 checkpoint。
 
@@ -1343,7 +1380,7 @@ Store / SqliteStore
 ### 11.1 语法检查
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
 ### 11.2 LangGraph Agent 实验
@@ -1365,9 +1402,10 @@ Store / SqliteStore
 .\.venv\Scripts\python.exe langgraph_rag_demo.py
 .\.venv\Scripts\python.exe langgraph_bm25_demo.py
 .\.venv\Scripts\python.exe langgraph_hybrid_rag_demo.py
+.\.venv\Scripts\python.exe langgraph_agentic_rag_demo.py
 ```
 
-这些是手动实验，不是正式自动化测试。`embedding_test.py`、`langgraph_rag_demo.py` 和 `langgraph_hybrid_rag_demo.py` 会访问 Embedding API；其中 `langgraph_rag_demo.py` 还会调用 Chat API。`langgraph_bm25_demo.py` 只使用本地文档与 BM25，不调用模型服务。向量脚本使用进程内 `InMemoryVectorStore`，每次运行会重新建立向量索引；混合检索脚本不会生成答案，仍会产生 Embedding 请求费用。
+这些是手动实验，不是正式自动化测试。`embedding_test.py`、`langgraph_rag_demo.py`、`langgraph_hybrid_rag_demo.py` 和 `langgraph_agentic_rag_demo.py` 会访问 Embedding API；`langgraph_rag_demo.py` 与 `langgraph_agentic_rag_demo.py` 还会调用 Chat API。`langgraph_bm25_demo.py` 只使用本地文档与 BM25，不调用模型服务。向量脚本使用进程内 `InMemoryVectorStore`，每次运行会重新建立向量索引；混合检索脚本不会生成答案，仍会产生 Embedding 请求费用。
 
 ### 11.4 MCP 天气 Agent
 
@@ -1432,7 +1470,9 @@ Store / SqliteStore
 - **RAG 基础与 Hybrid RAG 集成实验已完成（2026-09-29）**（`langgraph_rag_demo.py`）：2 份 Markdown 切分为 9 块；针对 ToolMessage 问题，维护者提供了 RRF Top-3 的各路名次和图级输出。Top-1 `react.md/start=363` 两路均第 1，Top-2 `react.md/start=0` 两路均第 2，Top-3 `stategraph.md/start=605` 仅 Dense 第 3；实际模型上下文顺序一致，回答使用相应 D# 编号。此结论仅覆盖一条集成正向路径，不代表系统化质量评估。
 - **BM25 独立检索实验已运行观察**（`langgraph_bm25_demo.py`）：3 个知识库内问题召回相关片段，询问 DeerFlow 长期记忆数据库时仍返回无关 Top-K；BM25 不具备自动拒答能力。
 - **Dense + BM25 + RRF 对比已完成并集成**（`langgraph_hybrid_rag_demo.py`）：独立入口保留检索器对比；`hybrid_retrieve()` 已由 `langgraph_rag_demo.py` 调用。知识库外问题仍可能返回无关候选，RRF 不负责答案存在性判断。
-- RAG 可选后续质量改进：扩大改写问法、跨文档、引用语义、库外拒答和检索失败的图级评估；D# 仍是本次上下文中的临时编号，不是稳定文档 ID；Top-K/RRF 排名和编号白名单不能替代答案存在性判断与引用语义校验。这些改进不阻塞进入 Subgraph / 并行学习。
+- **Agentic RAG 第一版已运行观察**（`langgraph_agentic_rag_demo.py`）：知识库问题路由到 `retrieve`，问候“你好”路由到 `direct`；retrieve 分支复用现有 Hybrid RAG helper，direct 分支绕过检索。仅证明这两个样例路径可运行，不代表路由准确率。`EvidenceReview`、`sufficient`、`retry_query` 目前只是未接入图的预留结构；证据充分性评估、查询改写、有界重试、知识库外拒答和引用语义验证都仍待实现。
+- Agentic RAG 的下一步是加入可观察的证据充分性判断，并明确其输入、输出和路由；之后再添加有上限的查询改写 / 重试及库外问题测试。不要一次同时引入重排、持久化向量库或复杂多 Agent 编排。
+- 固定两步 Hybrid RAG 的可选质量扩展：扩大改写问法、跨文档、引用语义、库外拒答和检索失败的图级评估；D# 仍是本次上下文中的临时编号，不是稳定文档 ID；Top-K/RRF 排名和编号白名单不能替代答案存在性判断与引用语义校验。这些基础 RAG 的广泛评测不阻塞后续章节；当前已开始的 Agentic RAG 学习顺序仍按 5.3 节先完成证据充分性实验，再继续推进。
 - 后续再学习 Subgraph、并行和 Supervisor/Multi-Agent。
 - 选择最终简历项目的真实业务场景。
 - 建立评估数据、Trace、成本统计和失败分析机制。
