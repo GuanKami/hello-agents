@@ -77,7 +77,7 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_rag_demo.py                               # 固定两步 Hybrid RAG：Dense + BM25 + RRF -> retrieve -> generate
 ├── langgraph_bm25_demo.py                              # 独立中文 BM25 Top-K 关键词检索
 ├── langgraph_hybrid_rag_demo.py                        # Dense + BM25 + RRF 对比；向 RAG 图提供融合检索函数
-├── langgraph_agentic_rag_demo.py                       # Agentic RAG 第一版：模型选择 direct / retrieve
+├── langgraph_agentic_rag_demo.py                       # Agentic RAG：规划、证据评估、有界重试与无证据退出
 ├── rag_docs/                                            # RAG 实验用的本地 Markdown 知识库
 │   ├── react.md
 │   └── stategraph.md
@@ -928,33 +928,39 @@ rag_docs/*.md
 
 ### 4.22 Agentic RAG 第一版：`langgraph_agentic_rag_demo.py`
 
-该实验在固定两步 Hybrid RAG 前加入规划节点，由模型决定走“直接回答”还是“检索后基于证据回答”。目前范围仅为这两条分支，不代表完整的 Agentic / Corrective RAG 系统。
+该实验在固定两步 Hybrid RAG 前加入规划节点，在检索后加入证据充分性评估、有限查询改写和无证据退出。它覆盖了 Agentic RAG 的一个可观察教学闭环，但不代表完整或生产级的 Agentic / Corrective RAG 系统。
 
 ```text
-START -> decide -- direct --> direct_answer -> END
-                 └ retrieve -> retrieve -> grounded_generate -> END
+START -> decide --direct--> direct_answer -> END
+             └--retrieve--> retrieve -> assess
+                                      ├ sufficient -> grounded_generate -> END
+                                      ├ retry -> apply_retry_query -> retrieve
+                                      └ no_evidence -> no_evidence -> END
 ```
 
 执行职责与数据流：
 
-- `RetrievalPlan` 通过 `with_structured_output(..., include_raw=True)` 将规划结果约束为 `action` 与 `query`；原始模型响应和解析错误会被打印，方便诊断结构化输出兼容性问题。
-- `decide_node` 只负责规划并把 `action`、`search_query` 写入 State。模型提出路由意图，`route_after_decide` 与条件边根据允许值选择已注册的节点；模型不会自行创建或修改图结构。
-- `retrieve_node` 将规划查询传给 `langgraph_hybrid_rag_demo.py` 的 `hybrid_retrieve()`，复用 Dense + BM25 + RRF，再将按融合名次排列的 `Document` 写入 State。
-- `direct_answer_node` 在图运行时不执行检索节点，适用于一般问候等不依赖知识库的问题，并要求模型不要声称查过本地资料。注意 `main()` 会在 `invoke()` 前统一加载语料并构建向量索引，所以 direct 仅跳过查询，不跳过启动索引成本。
-- `grounded_generate_node` 从 State 取回问题和文档，显式组装模型消息。State 中的文档不会自动进入 LLM 上下文。`[D1]` 等编号只在本次上下文中按检索顺序临时分配；提示词要求引用不能替代引用语义的程序化核验。
-- `EvidenceReview`、`sufficient` 和 `retry_query` 是后续证据评估 / 查询改写实验的预留定义，目前没有节点读取或写入它们，也没有重试循环。
-- `retrieval_count` 当前只记录实际执行的检索次数；在目前无循环拓扑中，retrieve 分支正常只检索一次。
+- `RetrievalPlan` 通过 `with_structured_output(..., include_raw=True)` 约束规划结果为 `action` 与 `query`；原始响应和解析错误会打印。结构化输出只约束数据形状，不保证 planner 的语义判断正确。
+- `decide_node` 将模型给出的 `action`、`search_query` 写入 State。`route_after_decide` 和条件边把动作映射到预先注册的节点，但当前没有 Python 策略保证知识问题必须走 `retrieve`；知识库外问题可能被误判为 `direct`。
+- `retrieve_node` 将规划查询传给 `langgraph_hybrid_rag_demo.py` 的 `hybrid_retrieve()`，复用 Dense + BM25 + RRF，并把按融合名次排列的 `Document` 写入 State；RRF 分数是排序信号，不是证据置信度。
+- `assess_node` 将当前召回片段及来源位置交给 `EvidenceReview`，评估它们是否直接支持回答，并可提出 `retry_query`。评估结果是模型判断，不等于程序化证明。
+- `route_after_assess` 以 Python 规则决定是否生成、重试或拒答：空查询、与当前查询相同的查询，或达到 `MAX_RETRIEVALS` 时进入 `no_evidence`。`MAX_RETRIEVALS=2` 计入首轮，故最多为首轮检索加一次重试；`apply_retry_query_node` 更新查询并清空旧 retry 字段。
+- `direct_answer_node` 在图运行时不执行检索节点，并要求模型不要声称查过本地资料。`main()` 仍在 `invoke()` 前统一加载语料并建立向量索引，因此 direct 只跳过图中的检索，不跳过启动索引成本。
+- `grounded_generate_node` 从 State 取回问题和文档，显式组装模型消息；State 中的文档不会自动进入 LLM 上下文。`[D1]` 等编号按本次上下文顺序临时分配，提示词要求引用不能替代引用语义校验。
+- `no_evidence_node` 在评估判断证据不足且不再允许有效重试时返回固定范围拒答。它不会判断模型自由回答分支是否误路由，因此不能补救 planner 误选 `direct`。
+- `retrieval_count` 由 `retrieve_node` 每执行一次递增，用于限制总检索次数；当前上限为 2。
 - 语料沿用 `rag_docs/*.md` 与现有切块 helper。向量检索使用 `InMemoryVectorStore`，每次运行重建索引；脚本真实运行会调用 Embedding API 和 Chat API，可能产生费用。
 - `graph.get_graph().draw_mermaid()` 只输出静态拓扑；`graph.invoke()` 才实际运行规划、路由、检索和回答节点。
 
-维护者提供的真实模型输出观察到两条路径：
+维护者提供的真实模型输出观察到以下路径和边界情况：
 
 ```text
-知识库问题 -> action=retrieve -> Dense/BM25/RRF -> grounded_generate
-“你好”    -> action=direct   -> direct_answer（未进入检索节点）
+“你好” -> action=direct -> direct_answer（未进入检索节点）
+库内 StateGraph 问题 -> retrieve -> assess(sufficient=true) -> grounded_generate
+库外 DeerFlow 问题 -> 一次误走 direct 并回答 SQLite；另一次 retrieve 两轮后 no_evidence
 ```
 
-这验证的是两种预期输入下的路径可达性，不是模型路由准确率或检索质量评测。当前尚未验证知识库外问题拒答、规划误判后的恢复、证据充分性判断、查询改写、有界重试、跨文档问题、引用语义和自动评估。
+观察结果说明 direct、证据充分生成、两轮检索后拒答路径都可以到达，但不是路由准确率或 RAG 质量评测。规划模型曾把库外 DeerFlow 数据库问题判为 direct 并生成无资料依据的 SQLite 说法，证明路由稳定性仍未解决；当前 Python 代码尚未加入“仅寒暄 direct、其他问题 retrieve”的确定性策略。库内问题也出现过 Edge 定义引用错配：定义证据在 `[D2]`，回答却引用 `[D3]`。引用语义尚未验收。另有 `assess` 运行异常日志但没有完整 traceback，根因未知；模型服务调用异常未被统一恢复。跨文档问题和自动评估也未验证。
 
 ## 5. 学习进度和路线（Learning Roadmap）
 
@@ -979,7 +985,7 @@ START -> decide -- direct --> direct_answer -> END
 - RAG 检索观察：Dense 与 BM25 分别召回 Top-3，RRF 按排名融合；已观察分数、各路名次和最终文档顺序。分数不是正确率，少量手动运行不构成跨问题评估。
 - BM25 中文关键词检索（`langgraph_bm25_demo.py`）：3 个知识库内问题检索到相关片段；知识库外 DeerFlow 问题仍返回无关 Top-K，说明 BM25 本身不负责拒答。
 - Dense + BM25 + RRF（`langgraph_hybrid_rag_demo.py`）：独立对比入口仍可观察两路候选及融合排名；`hybrid_retrieve()` 已由固定 RAG 图调用。集成图的 ToolMessage 问题 RRF 名次已验证：react.md start=363（Dense/BM25 均第 1，0.0328）、react.md start=0（均第 2，0.0323）、stategraph.md start=605（Dense 第 3、BM25 未命中，0.0159）。库外问题仍会返回候选。
-- **Agentic RAG 第一版（`langgraph_agentic_rag_demo.py`）**：已由维护者提供的运行结果观察知识库问题走 `retrieve`、一般问候“你好”走 `direct`；检索分支复用 Dense + BM25 + RRF，direct 分支不检索。当前只验证两种输入下的图分支，没有证据充分性评估、查询改写、重试、拒答节点或路由准确率评估；`EvidenceReview` 和相关 State 字段尚未接入。
+- **Agentic RAG 第一版（`langgraph_agentic_rag_demo.py`）**：已实现规划 `direct / retrieve`、Hybrid Retrieval、`EvidenceReview` 证据评估、最多一次查询改写重试和 `no_evidence` 退出。维护者提供的运行结果观察到问候 direct、库内问题评为证据充分，以及库外 DeerFlow 问题的一次错误 direct 和另一次两轮检索后拒答。错误 direct 曾生成资料不支持的 SQLite 说法；库内答案也出现 Edge 定义引用 `[D2]` 被错误标为 `[D3]`。因此当前只确认路径可运行，不代表稳定路由、证据判断或引用语义已通过验收。
 - `InMemoryStore` 的进程生命周期限制。
 - **`SqliteStore` 持久化（课程 Notebook 形式，2026-09-10 维护者确认已完成）**：在 `dive-into-langgraph/6.context.ipynb` 第三节中，用 `sqlite3.connect("user-info.db", check_same_thread=False, isolation_level=None)` 建连接，交给 `SqliteStore(conn)` 作为 Store 后端，用 `store.put(("user_info",), key, value)` 预置资料，再在工具内用 `runtime.store.get(("user_info",), user_id)` 读取。已掌握"**Store 后端可替换、长期资料的生命周期由后端决定**"这一机制。
 
@@ -1013,7 +1019,7 @@ START -> decide -- direct --> direct_answer -> END
 RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
 ```
 
-另：仓库自行实现的 Agentic RAG 第一版（`langgraph_agentic_rag_demo.py`）已观察 direct / retrieve 两个分支；这不代表课程中的 Agentic Hybrid Search 拓展章节已完成，证据评估与查询改写也尚未实现。
+另：仓库自行实现的 Agentic RAG 第一版（`langgraph_agentic_rag_demo.py`）已加入证据评估、有界重试和无证据退出；这不代表课程中的 Agentic Hybrid Search 拓展章节已完成，也不代表路由、引用或整体 RAG 质量已稳定。
 
 后续不应重复堆叠同一种用户资料读写 Demo，而应转向跨组件设计和 Agent 工程能力。
 
@@ -1031,7 +1037,7 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
        -> 固定两步 Hybrid RAG 已接入并端到端运行；ToolMessage 问题的 Dense/BM25 名次、RRF 顺序、模型上下文和 D# 回指已观察（截至 2026-09-29）
        -> BM25 独立检索已运行：3 个库内问题召回相关片段，1 个库外问题仍返回候选
        -> Dense + BM25 + RRF 独立对比已在多个场景运行；融合 helper 已复用到 RAG 图
-       -> Agentic RAG 第一版已运行观察 direct / retrieve 两分支；证据评估与查询改写未实现
+       -> Agentic RAG 已接入证据评估、最多一次查询重试和无证据退出；暴露出 direct 误路由与 D# 引用错配
 ```
 
 **SqliteStore 这一项的结论（2026-09-10 维护者确认，原"顺序偏离"记录作废）**：
@@ -1042,7 +1048,7 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
 - 将来若需要根目录级别的跨进程长期记忆（例如 HITL 恢复实验，或简历项目要真的记住用户资料），**四个实验都通过 `build_store()` 单点注入 Store**，改这一处即可，不需要重写实验。
 - 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
-固定两步 Hybrid RAG 基础里程碑已完成一次端到端正向运行；Agentic RAG 当前完成第一版 direct / retrieve 两分支观察。下一步应在此脚本中学习“检索证据是否足够回答”的评估，再讨论如何通过有限次数的查询改写和重试恢复；不要将 `EvidenceReview` 或预留 State 字段误写成已实现功能。Top-K 和 RRF 只排序候选，不会自动识别知识库外问题。小型语料和少量手动输出也不能证明路由、证据充分性或引用语义具备稳定准确率。Middleware 重试、HITL 错误 `thread_id`、`edit/respond` 等属于可选补充，不阻塞主线。MCP 天气实验仍只验证过两次北京单工具实时查询，其他城市、逐日预报和异常路径未覆盖。
+固定两步 Hybrid RAG 基础里程碑已完成一次端到端正向运行；Agentic RAG 已实现规划、证据评估、最多一次改写重试和无证据退出，并由维护者提供的运行结果观察到相关路径。当前暴露的主要问题是：知识库外问题有时被 planner 错误路由到 direct 并产生无依据答案；证据充分时也出现过 D# 引用错配；另有 assess 异常日志但无完整 traceback，根因未明。下一步应先稳定 direct/retrieve 策略，再分别验收证据判断、拒答和引用支持关系，不要把结构化输出或一次成功运行当成准确性保证。Top-K 和 RRF 只排序候选，不会自动识别知识库外问题。小型语料和少量手动输出不能证明质量稳定。Middleware 重试、HITL 错误 `thread_id`、`edit/respond` 等属于可选补充，不阻塞主线。MCP 天气实验仍只验证过两次北京单工具实时查询，其他城市、逐日预报和异常路径未覆盖。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -1069,9 +1075,10 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
    -> 独立 BM25 中文关键词检索 [已运行观察]
    -> Dense + BM25 + RRF 对比 [已运行观察]
    -> 将混合检索接入固定 RAG StateGraph，并验证一次端到端正向问题及 RRF 名次 [已完成]
-   -> Agentic RAG direct / retrieve 两分支 [已观察]
-   -> 证据充分性评估节点 [下一步]
-   -> 有界查询改写 / 重试、知识库外拒答与引用评估 [待实现和验证]
+   -> Agentic RAG direct / retrieve 两分支 [已观察；知识库外问题曾误走 direct]
+   -> 证据充分性评估节点 [已实现并观察运行；模型判断稳定性未评估]
+   -> 最多一次查询改写重试与 no_evidence 退出 [已实现并观察一条两轮拒答路径]
+   -> 稳定路由策略、引用语义校验、assess 异常诊断与多问题评估 [当前待办]
 7. Parallelization / Subgraph / Map-Reduce
 8. Supervisor / Multi-Agent
 9. Evaluation / Observability / Cost / Failure Analysis
@@ -1470,9 +1477,10 @@ Store / SqliteStore
 - **RAG 基础与 Hybrid RAG 集成实验已完成（2026-09-29）**（`langgraph_rag_demo.py`）：2 份 Markdown 切分为 9 块；针对 ToolMessage 问题，维护者提供了 RRF Top-3 的各路名次和图级输出。Top-1 `react.md/start=363` 两路均第 1，Top-2 `react.md/start=0` 两路均第 2，Top-3 `stategraph.md/start=605` 仅 Dense 第 3；实际模型上下文顺序一致，回答使用相应 D# 编号。此结论仅覆盖一条集成正向路径，不代表系统化质量评估。
 - **BM25 独立检索实验已运行观察**（`langgraph_bm25_demo.py`）：3 个知识库内问题召回相关片段，询问 DeerFlow 长期记忆数据库时仍返回无关 Top-K；BM25 不具备自动拒答能力。
 - **Dense + BM25 + RRF 对比已完成并集成**（`langgraph_hybrid_rag_demo.py`）：独立入口保留检索器对比；`hybrid_retrieve()` 已由 `langgraph_rag_demo.py` 调用。知识库外问题仍可能返回无关候选，RRF 不负责答案存在性判断。
-- **Agentic RAG 第一版已运行观察**（`langgraph_agentic_rag_demo.py`）：知识库问题路由到 `retrieve`，问候“你好”路由到 `direct`；retrieve 分支复用现有 Hybrid RAG helper，direct 分支绕过检索。仅证明这两个样例路径可运行，不代表路由准确率。`EvidenceReview`、`sufficient`、`retry_query` 目前只是未接入图的预留结构；证据充分性评估、查询改写、有界重试、知识库外拒答和引用语义验证都仍待实现。
-- Agentic RAG 的下一步是加入可观察的证据充分性判断，并明确其输入、输出和路由；之后再添加有上限的查询改写 / 重试及库外问题测试。不要一次同时引入重排、持久化向量库或复杂多 Agent 编排。
-- 固定两步 Hybrid RAG 的可选质量扩展：扩大改写问法、跨文档、引用语义、库外拒答和检索失败的图级评估；D# 仍是本次上下文中的临时编号，不是稳定文档 ID；Top-K/RRF 排名和编号白名单不能替代答案存在性判断与引用语义校验。这些基础 RAG 的广泛评测不阻塞后续章节；当前已开始的 Agentic RAG 学习顺序仍按 5.3 节先完成证据充分性实验，再继续推进。
+- **Agentic RAG 当前实现状态**（`langgraph_agentic_rag_demo.py`）：`decide` 规划、`retrieve` Hybrid 检索、`assess` 证据判断、`apply_retry_query` 有界重试和 `no_evidence` 退出均已接入图。运行结果观察到问候走 direct、库内问题的证据充分路径，以及库外 DeerFlow 问题的一次错误 direct 和另一次“首轮检索 + 一次重试”后拒答。后者证明有界退出路径可达，不证明拒答准确率。
+- **未通过的 Agentic RAG 验收点**：planner 对知识库外问题的路由不稳定，曾直接给出无来源的 SQLite 断言；回答 StateGraph 概念时，Edge 定义的支持片段在 `[D2]`，模型却引用 `[D3]`；另一次 `assess` 报错只有 LangGraph 外层节点名，没有完整内部 traceback，根因未诊断。结构化输出和提示词不能替代这些验证。
+- Agentic RAG 下一步先稳定 direct/retrieve 路由，再建立小型用例集分别验收库内直答、库内改写问法、库外拒答、引用逐条支持和评估调用异常。暂不同时加入重排、持久化向量库或复杂多 Agent 编排。
+- 固定两步 Hybrid RAG 的可选质量扩展：扩大改写问法、跨文档、引用语义、库外拒答和检索失败的图级评估；D# 仍是本次上下文中的临时编号，不是稳定文档 ID；Top-K/RRF 排名和编号白名单不能替代答案存在性判断与引用语义校验。这些基础 RAG 的广泛评测不阻塞后续章节；Agentic RAG 的当前未完成验收点按 5.3 节处理，不能再把已接入的证据充分性节点记为待实现。
 - 后续再学习 Subgraph、并行和 Supervisor/Multi-Agent。
 - 选择最终简历项目的真实业务场景。
 - 建立评估数据、Trace、成本统计和失败分析机制。

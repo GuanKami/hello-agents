@@ -41,8 +41,9 @@ htmlcov/
 
 # ===== 本地工具配置 =====
 .omo/
-# Claude Code 的本地权限设置（含本机绝对路径与批准记录），属本地配置
-.claude/settings.local.json
+# Local Agent and Claude Code skills/settings
+.agents/
+.claude/
 
 # ===== 操作系统 =====
 .DS_Store
