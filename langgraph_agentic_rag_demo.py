@@ -20,35 +20,34 @@
                                       └ no_evidence -> no_evidence -> END
 
 实现方式：
-    decide 节点通过 RetrievalPlan 输出 action 和首轮 query；当前 action 由模型决定，
-    Python 条件边只负责把它映射到预先注册的分支。retrieve 节点复用 Dense + BM25 +
-    RRF；assess 节点用 EvidenceReview 判断证据充分性并提出 retry_query；Python 路由
-    限制总检索次数最多为 MAX_RETRIEVALS。证据充分时才进入 grounded_generate，达到
-    上限或没有有效新查询时进入 no_evidence。direct 分支独立回答，不声称查过本地资料。
+    decide 节点先用 Python 规则识别独立寒暄并路由到 direct；其他输入调用规划模型改写
+    检索查询，但最终 action 固定为 retrieve。retrieve 复用 Dense + BM25 + RRF；assess
+    判断证据是否充分，证据不足时可改写查询并在程序限制内重试；充分时进入
+    grounded_generate，否则进入 no_evidence。direct 分支独立回答，不声称查过本地资料。
 
 验证方式：
-    维护者提供的真实模型输出观察到问候进入 direct；知识库内问题进入 retrieve，
-    EvidenceReview 判为 sufficient；知识库外 DeerFlow 问题曾被规划模型误判为 direct，
-    另一次运行则完成两次检索、两次证据不足后进入 no_evidence。知识库内回答出现过
-    D# 引用错配，因此引用语义尚未通过验收。这些是少量手动观察，不是自动化评测。
-    运行会调用 Embedding API 和 Chat API，可能产生费用。
+    已通过少量真实模型手动验收：独立问候进入 direct；知识库内 StateGraph 问题及带有
+    问候的知识问题进入 retrieve；知识库外 DeerFlow 问题经过两次证据不足判断后进入
+    no_evidence。该结果验证固定路由分支，不代表引用质量或整体回答质量通过。回答中
+    曾观察到 D# 引用错配。运行会调用 Embedding API 和 Chat API，可能产生费用。
 
 学习总结：
-    结构化输出只约束字段形状，不保证路由判断正确；当前程序尚未用规则校验 direct
-    是否只用于寒暄。证据评估负责判断召回内容是否支持答案，是否继续检索则由 Python
-    条件路由和次数上限控制。检索结果保存在 State 中，也必须由生成节点显式加入模型消息。
+    固定路由策略只允许独立寒暄走 direct，其他输入一律 retrieve；规划模型提供查询改写，
+    不再决定是否绕过检索。结构化输出只约束字段形状，不保证证据判断或答案正确。证据
+    评估负责判断召回内容是否支持答案，重试与退出由 Python 条件路由和次数上限控制。
+    检索结果保存在 State 中，也必须由生成节点显式加入模型消息。
 
 已知限制：
-    planner 仍可能把知识库外事实问题误判为 direct，导致无证据的自由回答；确定性的
-    direct 策略保护尚未实现。EvidenceReview 也是模型判断，不能保证评估稳定或无误。
-    达到上限时只保证停止重试，不保证检索质量；模型调用等运行时异常仍可能使图失败。
-    D# 是单次模型上下文中的临时编号，提示词约束不等于程序化引用校验；已观察到引用
-    错配。语料仅有少量本地文档，向量索引使用 InMemoryVectorStore，进程结束后丢失。
-    direct 分支虽跳过图中的检索节点，但 main() 在 invoke 前仍统一加载语料并建索引。
+    direct 目前只识别一组固定的独立问候/感谢文本；翻译、改写、总结及依赖多轮对话的
+    direct 用例尚未实现。EvidenceReview 仍由模型判断，不能保证稳定或无误；检索次数
+    上限只保证停止重试，不保证检索质量。D# 是单次上下文中的临时编号，提示词要求
+    不能代替引用校验，且已观察到错配。语料仅有少量本地文档，向量索引使用
+    InMemoryVectorStore，进程结束后丢失。direct 虽跳过检索节点，main() 仍会预先加载
+    语料并建索引。模型调用等运行时异常仍可能使图失败。
 
 后续优化方向：
-    为 direct 分支增加明确、可观察的程序策略，并用库内、库外、改写问法和跨文档问题
-    验收路由与证据评估；再独立检查引用是否真正支持对应结论，并诊断评估节点异常。
+    扩展 direct 任务白名单并继续用库内、库外、混合问法验收路由；随后单独改进引用
+    对齐与语义支持验收，并诊断评估节点异常。
 """
 
 import os
@@ -109,6 +108,14 @@ class AgenticRAGState(TypedDict):
     retry_query: NotRequired[str | None]
     answer: NotRequired[str]
 
+def is_standalone_small_talk(question: str) -> bool:
+    """只识别独立的寒暄/感谢，不把带知识问题的句子误判为寒暄。"""
+    normalized = question.strip().strip("，。！？!?、 ")
+    return normalized in {
+        "你好", "你好呀", "您好", "嗨", "哈喽",
+        "早上好", "晚上好", "谢谢", "谢谢你", "感谢",
+    }
+
 def load_documents() -> list[Document]:
     """加载本地 Markdown，并保留来源元数据供切块、检索和引用定位。"""
     documents = []
@@ -168,6 +175,15 @@ def build_graph(vector_store, llm, bm25, chunks):
 
     def decide_node(state: AgenticRAGState):
         """调用规划模型并写入路由字段；检索和最终回答由后续节点执行。"""
+        question = state["question"].strip()
+
+        if is_standalone_small_talk(question):
+            print("[route policy] effective_action=direct, reason=standalone small talk")
+            return {
+                "action": "direct",
+                "search_query": "",
+            }
+
         result = planner.invoke(
             [
                 SystemMessage(
@@ -195,11 +211,20 @@ def build_graph(vector_store, llm, bm25, chunks):
 
         print("[planner parsed]", plan)
 
-        # 当前将模型给出的 action 原样写入 State；Python 条件边负责映射分支，
-        # 但尚未用确定性规则限制 direct 只能用于寒暄，因此知识问题可能被误路由。
+        # planner_action 只用于观察模型的原始判断，不直接决定图的执行路径。
+        # 本实验采用保守路由策略：独立寒暄已在前面直接进入 direct；
+        # 其他请求统一进入 retrieve，确保知识问题不会因模型误判而跳过检索。
+        planner_action = plan.action  # 仅用于观察模型原始判断
+        effective_query = plan.query.strip() or question
+
+        print(
+            f"[route policy] planner_action={planner_action}, "
+            "effective_action=retrieve"
+        )
+
         return {
-            "action": plan.action,
-            "search_query": plan.query.strip(),
+            "action": "retrieve",
+            "search_query": effective_query,
         }
 
     def retrieve_node(state: AgenticRAGState):
@@ -325,10 +350,8 @@ def build_graph(vector_store, llm, bm25, chunks):
             )
 
         context = "\n\n".join(context_blocks)
-        # 限定模型可用的编号集合，但不能程序化证明某编号确实支持相邻结论。
-        available_citations = ", ".join(
-            f"[D{i}]" for i in range(1, len(documents) + 1)
-        ) or "无"
+        # 告知模型本轮可用的临时编号；这只是提示约束，不会验证引用是否真正支持结论。
+        available_citations = ", ".join(citation_ids) or "无"
 
         system_message = SystemMessage(
             content=(
@@ -336,11 +359,10 @@ def build_graph(vector_store, llm, bm25, chunks):
                 "只能使用本次提供的资料，不要用背景知识补充资料没有明确说明的事实。"
                 "先按问题逐项回答；每个关键事实后都要紧跟直接支持它的片段编号。"
                 "优先引用直接定义该事实的片段；概述只能支持概述，示例只能支持示例。"
-                "例如，片段只说节点返回字段更新，就不要据此断言 State 是可变或不可变对象。"
                 "如果某个结论没有直接证据，就删去该结论，或说明资料不足。"
                 f"本次可引用的编号只有：{available_citations}。"
                 "不要编造编号。"
-                "引用编号必须按上下文块标题中的 [D#] 对应，不能凭检索顺序或记忆猜编号；回答前逐条确认被引用的块确实支持该事实。"
+                "引用编号必须对应上下文块标题中的 [D#]；回答前确认该片段确实支持所述事实。"
             )
         )
 
@@ -355,7 +377,7 @@ def build_graph(vector_store, llm, bm25, chunks):
         print(context)
 
         # State 中的 Document 不会自动进入模型上下文，必须在这里显式传给 LLM。
-        # 引用编号约束仍只是提示词；当前没有独立节点验证引用是否支持相邻结论。
+        # 引用要求仍只是提示词；本阶段不做结构化引用解析或自动校验。
         response = llm.invoke(
             [
                 system_message,
@@ -418,7 +440,6 @@ def build_graph(vector_store, llm, bm25, chunks):
     builder.add_edge("apply_retry_query", "retrieve")
     builder.add_edge("grounded_generate", END)
     builder.add_edge("no_evidence", END)
-    builder.add_edge("grounded_generate", END)
 
     # compile() 将 State schema、节点和边组装为可运行图；Mermaid 只展示拓扑，
     # 只有 invoke()/stream() 才会实际执行节点和外部模型调用。
@@ -442,9 +463,8 @@ def main() -> None:
         base_url=os.getenv("LLM_BASE_URL"),
     )
 
-    # 当前用知识库外的 DeerFlow 问题观察规划与拒答路径；模型也可能误选 direct，
-    # 因而该样例同时用于暴露当前尚未解决的路由不稳定问题。
-    query = "DeerFlow 使用什么数据库保存长期记忆？"
+    # 使用知识库内的 StateGraph 问题观察固定 retrieve 路由、证据评估与生成路径。
+    query = "StateGraph 中 State、Node、Edge 分别负责什么？"
 
     documents = load_documents()
     # 固定 Hybrid RAG 与 Agentic RAG 共用切块和索引流程，便于聚焦比较是否增加规划。
