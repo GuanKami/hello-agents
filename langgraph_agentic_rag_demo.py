@@ -60,7 +60,6 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.vectorstores import InMemoryVectorStore
 from langgraph.graph import END, START, StateGraph
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
