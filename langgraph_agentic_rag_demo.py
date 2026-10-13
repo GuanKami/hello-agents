@@ -29,7 +29,10 @@
     已通过少量真实模型手动验收：独立问候进入 direct；知识库内 StateGraph 问题及带有
     问候的知识问题进入 retrieve；知识库外 DeerFlow 问题经过两次证据不足判断后进入
     no_evidence。该结果验证固定路由分支，不代表引用质量或整体回答质量通过。回答中
-    曾观察到 D# 引用错配。运行会调用 Embedding API 和 Chat API，可能产生费用。
+    2026-10-13 维护者提供了引用正向样例及两类负向检查：D99 被程序识别；有效 D3
+    不支持 Node 返回字段更新，需人工核对。后续答案仍把来自 D2 的 Edge 原文标为 D1。
+    完成的是基础验收方法，不是引用正确性保证。第二轮 assess 解析失败后保守退出
+    也已观察，不能记为两轮正常评估。运行会调用外部 API，可能产生费用。
 
 学习总结：
     固定路由策略只允许独立寒暄走 direct，其他输入一律 retrieve；规划模型提供查询改写，
@@ -46,11 +49,12 @@
     语料并建索引。模型调用等运行时异常仍可能使图失败。
 
 后续优化方向：
-    扩展 direct 任务白名单并继续用库内、库外、混合问法验收路由；随后单独改进引用
-    对齐与语义支持验收，并诊断评估节点异常。
+    基础路径和引用验收方法阶段性收口，下一主线学习 Subgraph，再学习并行和 Multi-Agent。
+    保留引用错配失败样例，后续完善摘录归属检查、逐条支持评估及 assess 异常处理。
 """
 
 import os
+import re
 from dotenv import load_dotenv
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
@@ -156,6 +160,21 @@ def route_after_assess(state: AgenticRAGState) -> str:
 
     return "retry"
 
+def inspect_citation_ids(answer: str, citation_ids: list[str]) -> dict:
+    """检查全文编号存在性；不判断摘录归属、逐条覆盖或语义支持。
+
+    missing_citations 仅表示未匹配到任何 [D数字]，只有无效 D99 时也为 False。
+    invalid_ids 才指出允许集合外的编号。报告只供观察，不改变路由或拦截答案。
+    """
+    allowed = set(citation_ids)
+    used = set(re.findall(r"\[D\d+\]", answer))
+
+    return {
+        "used_ids": sorted(used),
+        "invalid_ids": sorted(used - allowed),
+        "missing_citations": not used,
+    }
+
 def build_graph(vector_store, llm, bm25, chunks):
     """通过依赖注入组装图，避免节点函数依赖 main() 中的隐式全局变量。"""
     # include_raw=True 让调试输出同时保留原始消息、解析结果和解析异常；
@@ -229,8 +248,8 @@ def build_graph(vector_store, llm, bm25, chunks):
 
     def retrieve_node(state: AgenticRAGState):
         """用规划节点给出的查询执行 Dense + BM25 + RRF，并把排序后的文档写入 State。"""
-        # 这一版只让 Agent 决定“是否检索”和首轮查询文本；检索仍复用已验证的
-        # Hybrid RAG helper，而不是让模型自行调用任意检索工具。
+        # 是否检索由固定路由控制；模型只提出查询文本。复用 Hybrid RAG helper，
+        # 将查询改写与实际检索分开，便于观察本轮实际召回了什么。
         ranked_results = hybrid_retrieve(
             vector_store=vector_store,
             bm25=bm25,
@@ -363,6 +382,11 @@ def build_graph(vector_store, llm, bm25, chunks):
                 f"本次可引用的编号只有：{available_citations}。"
                 "不要编造编号。"
                 "引用编号必须对应上下文块标题中的 [D#]；回答前确认该片段确实支持所述事实。"
+                "为了方便验收，每条回答必须包含三个部分："
+                "结论：只表达一个可以被资料支持的事实。"
+                "引用：使用本轮上下文中的 [D#] 编号。"
+                "证据原文：从该编号对应的片段中逐字摘录支持结论的文本。"
+                "不要改写或编造证据原文；没有证据的结论不要输出。"
             )
         )
 
@@ -377,7 +401,8 @@ def build_graph(vector_store, llm, bm25, chunks):
         print(context)
 
         # State 中的 Document 不会自动进入模型上下文，必须在这里显式传给 LLM。
-        # 引用要求仍只是提示词；本阶段不做结构化引用解析或自动校验。
+        # 结论、引用、证据原文仍为普通文本格式，没有强制的结构化输出 Schema。
+        # 后续只检查编号存在性；摘录归属和语义支持关系仍需人工核对。
         response = llm.invoke(
             [
                 system_message,
@@ -385,9 +410,14 @@ def build_graph(vector_store, llm, bm25, chunks):
             ]
         )
 
+        answer = response.content
+        # 检查真实模型回答；报告即使发现错误也不拦截或修复返回答案。
+        report = inspect_citation_ids(answer, citation_ids)
+        print("[citation check]", report)
+
         return {
-            "answer": response.content,
-        }
+            "answer": answer
+            }
 
     def apply_retry_query_node(state: AgenticRAGState):
         """把评估器提出的新查询应用到 State，供下一轮 retrieve 使用。"""
@@ -414,7 +444,8 @@ def build_graph(vector_store, llm, bm25, chunks):
     builder.add_node("no_evidence", no_evidence_node)
 
     builder.add_edge(START, "decide")
-    # LLM 只能在两个预先声明的 action 中选择；模型提出决策，程序控制允许的流程。
+    # 条件边读取有效 action：独立寒暄 direct，其他输入固定 retrieve。
+    # planner 原始 action 只供观察，不直接控制这里的路由。
     builder.add_conditional_edges(
         "decide",
         route_after_decide,
@@ -486,8 +517,23 @@ def main() -> None:
     print("=== StateGraph Mermaid 源码 ===")
     print(graph.get_graph().draw_mermaid())
 
+    # 负向样例参照维护者贴出的本轮上下文：D3 不支持 Node 字段更新。
+    # 编号存在会通过，人工核对应失败；D 编号每轮变化，不能作为永久规则。
+    # 当前保留调用但未打印 report；历史负向日志由维护者提供。
+    test_answer = (
+        "结论：Node 读取当前 State，并返回需要合并回 State 的字段更新。\n"
+        "引用：[D3]"
+    )
+
+    report = inspect_citation_ids(
+        test_answer,
+        ["[D1]", "[D2]", "[D3]"],
+    )
+
     # 图运行时先规划；retrieve 分支还会经历证据评估和有限重试/拒答路由。
     result = graph.invoke({"question": query})
+    # answer 汇总所有结束分支；no_evidence 是程序固定文本，其余两支由模型生成。
+    print("\n=== Agent 最终回答 ===")
     print(result["answer"])
 
 if __name__ == "__main__":

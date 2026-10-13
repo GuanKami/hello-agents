@@ -6,7 +6,7 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 10 月 9 日，已经完成 LangGraph 快速入门、状态图、Memory、Context Engineering、Middleware 核心实验，以及 Human-in-the-loop 的同进程和 SqliteSaver 跨进程 approve/reject 最小路径。MCP 天气 Agent 已迁移到 LangChain 内置 `MCPAdapter` 并完成真实天气调用；固定两步 Hybrid RAG 已完成一次端到端正向验证。Agentic RAG 已接入固定路由、证据评估、最多两次检索（首轮加一次重试）及无证据退出；四个路由用例观察到预期分支，引用语义及更广泛质量仍未验收。
+> 截至 2026 年 10 月 13 日，LangGraph 基础、Memory、Context Engineering、Middleware、HITL、MCP 与基础 Hybrid RAG 已完成相关实验。Agentic RAG 基础路径、编号检查及人工引用正负向核对方法已阶段性收口，下一主线 Subgraph；引用来源错配、assess 解析异常和更广评测仍是已知限制。
 >
 > 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 Hybrid RAG 输出读取 2 份 Markdown 并切分为 9 个文本块。针对 ToolMessage 问题，RRF Top-3 为 `react.md/start=363`（Dense/BM25 均第 1，0.0328）、`react.md/start=0`（均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）；图实际发送给 LLM 的上下文顺序与融合排名一致，答案使用了对应的 `[D1]`、`[D2]`、`[D3]`。这是一条小型语料上的正向端到端验证，不代表系统化检索质量、引用语义或库外拒答评估。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
@@ -64,9 +64,20 @@ START -> decide --direct--> direct_answer -> END
 - `route_after_assess` 由程序检查评估结果、查询是否为空或与原查询相同，以及 `MAX_RETRIEVALS=2`。这里的 2 包含首轮检索，因此最多是首轮加一次重试；达到边界后进入 `no_evidence`。`grounded_generate` 显式将问题和证据加入模型上下文。
 - `direct_answer` 在图运行时绕过检索节点，不声称查过本地资料；但 `main()` 仍会在 `invoke()` 前加载语料、建立索引，所以 direct 仍有启动成本。
 - 固定路由手动验收观察到：“你好。”进入 `direct`；库内 StateGraph 问题进入 `retrieve`；“你好 + StateGraph 知识问题”仍进入 `retrieve`；库外 DeerFlow 数据库问题进入 `retrieve`，经首轮和一次重试后进入 `no_evidence`。这验证的是当前固定规则覆盖的少量输入，不代表通用路由准确率或拒答准确率。旧版 planner 误选 `direct` 的问题已由固定路由策略规避。
-- 生成节点仍是普通文本生成，并通过提示词要求模型在关键事实后标注本轮上下文的 `[D#]`；当前没有程序化校验引用编号或“结论—证据”支持关系。此前库内问题曾把 Edge 定义引用到 `[D3]`，而支持内容实际在 `[D2]`，所以引用语义仍未验收。
-- 另有 `assess` 节点异常日志，但没有完整内部 traceback，原因尚未确认。当前评估节点处理结构化输出解析失败；模型服务或网络等调用异常仍可能令图执行失败。
+- 生成节点输出普通文本“结论、引用、证据原文”。`inspect_citation_ids()` 只检查全文编号存在性，不检查逐条引用覆盖、摘录归属或语义支持，不拦截或修复答案。missing_citations=False 仅指匹配到编号，只有无效 D99 时也为 False。
+- 第二轮 assess 解析失败后在上限处保守进入 no_evidence 已观察，这是异常兜底而非正常证据不足判断。首轮解析失败仍抛错，网络和模型调用异常未统一处理。
 - 运行时会调用 Embedding API 和 Chat API；向量索引使用 `InMemoryVectorStore`，每次进程启动后重新建立，不提供持久化。
+
+引用验收记录（2026-10-13，依据维护者提供的输出）：
+
+| 用例 | 检查结果 | 验收边界 |
+| --- | --- | --- |
+| State/D1、Node/D2、Edge/D2 的正向回答 | 编号存在，摘录在所引片段内并支持结论 | 一条正向样例通过 |
+| 测试文本引用 D99 | invalid_ids 包含 D99 | 无效编号检查通过 |
+| Node 返回字段更新却引用有效 D3 | 编号通过；本轮 D3 不支持该结论 | 人工可识别不支持 |
+| 实际 Edge 回答标 D1，摘录来自 D2 | 编号通过；人工发现来源错配 | 引用正确性仍有缺陷 |
+
+基础验收方法完成不代表引用稳定，应保留失败样例。当前 main() 保留有效 D3 的负向调用但没有打印报告，已贴出的负向日志是此前手动验收记录。所有结束分支统一打印“Agent 最终回答”；no_evidence 是程序固定文本，其余两支由模型生成。
 
 ## 项目目标
 
@@ -170,7 +181,7 @@ LLM API
 - 这些记录证明两次单工具实时天气请求成功，不代表多工具 ReAct 循环、其他城市、异常路径或逐日天气预报已验证。湿度结果与服务端按 0–1 比例格式化的假设相符，但不替代完整 Schema 和边界值检查。地点名“北京市北京”仍有重复，可后续修正展示。
 - 此前输出里的固定“始终晴朗”内容属于旧教学工具，不是实时天气结果。
 
-当前尚未完成的内容包括：`wrap_model_call` 的有限重试、HITL 的错误 `thread_id` 负向验证、`edit/respond`、审批身份、超时和审计；Agentic RAG 的引用语义验证、`assess` 运行时异常诊断和更广泛评测；还有 Subgraph、并行和 Multi-Agent。固定路由已完成当前四个手动用例的阶段性验收，但规则只覆盖少量独立问候/感谢，其余问题全部检索，仍需考虑更完整的产品路由策略。当前 Agentic RAG 已有证据评估、有界重试和无证据退出，但少量手动运行不代表稳定或生产级 Corrective RAG。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+Agentic RAG 基础路径与引用验收方法已阶段性收口，后续进入 Subgraph、并行和 Multi-Agent。质量任务仍包括摘录归属/语义检查、assess 首轮解析失败及调用异常、更广评测。Middleware 重试和 HITL 扩展仍是补充项。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
@@ -179,7 +190,7 @@ LLM API
 | [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步 Hybrid RAG：Dense + BM25 + RRF、State 传递和带引用生成 | 已完成一次端到端正向运行，图内 RRF 名次与模型上下文/D# 顺序一致；更广评测与库外拒答待后续补充 |
 | [`langgraph_bm25_demo.py`](langgraph_bm25_demo.py) | jieba 中文分词与 BM25 关键词 Top-K 检索 | 独立单路基线；3 个库内查询命中相关片段，库外问题仍返回候选 |
 | [`langgraph_hybrid_rag_demo.py`](langgraph_hybrid_rag_demo.py) | Dense + BM25 + RRF 排名融合与可复用 helper | 独立对比入口已验证；`hybrid_retrieve()` 已集成到 RAG StateGraph |
-| [`langgraph_agentic_rag_demo.py`](langgraph_agentic_rag_demo.py) | 独立寒暄 direct、其他输入 retrieve；证据评估、最多一次查询重试和无证据退出 | 四个固定路由用例观察到预期分支；引用逐条支持、异常诊断和更广评测仍待完成 |
+| [`langgraph_agentic_rag_demo.py`](langgraph_agentic_rag_demo.py) | 固定路由、证据评估、有界重试、编号诊断与人工核对 | 基础验收方法收口；来源错配与解析异常仍保留，下一主线 Subgraph |
 | [`tools.py`](tools.py) | 共享工具、权限控制、用户资料读写 | 已使用 |
 | [`langgraph_react.py`](langgraph_react.py) | 高层 `create_agent` Agent API | 学习实验，存在待修正缺陷 |
 | [`langgraph_state_react.py`](langgraph_state_react.py) | 显式 StateGraph ReAct 和 ToolNode | 已完成基础实验 |
@@ -373,7 +384,7 @@ Middleware
   -> Human-in-the-loop edit/respond 与负向 thread_id 验证（可选补充）
   -> MCP 天气 Agent（已验证两次真实天气工具调用和结果回传；其他路径未验证）
   -> 固定两步 Hybrid RAG 已接入并完成一次端到端正向运行，RRF 名次、模型上下文和 D# 映射一致
-  -> Agentic RAG：固定路由四个手动用例已观察预期分支；引用逐条支持、assess 异常诊断及更广评测待验收
+  -> Agentic RAG：基础路径、编号检查与人工正负向核对方法收口；引用错配与 assess 异常为后续质量任务
   -> 固定两步 RAG 的改写问法、跨文档、引用语义及库外拒答扩展评测（可选质量改进）
   -> Subgraph / Parallel / Map-Reduce
   -> Supervisor / Multi-Agent
