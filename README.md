@@ -6,7 +6,7 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 10 月 14 日，LangGraph 基础、Memory、Context Engineering、Middleware、HITL、MCP 与基础 Hybrid RAG 已完成相关实验。Agentic RAG 基础路径、编号检查及人工引用正负向核对方法已阶段性收口，Subgraph 基础已完成，固定并行及 reducer 已完成，下一主线 Send / Map-Reduce；引用来源错配、assess 解析异常和更广评测仍是已知限制。
+> 截至 2026 年 10 月 16 日，LangGraph 基础、Memory、Context Engineering、Middleware、HITL、MCP 与基础 Hybrid RAG 已完成相关实验。Agentic RAG 基础路径、编号检查及人工引用正负向核对方法已阶段性收口，Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent；引用来源错配、assess 解析异常和更广评测仍是已知限制。
 >
 > 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 Hybrid RAG 输出读取 2 份 Markdown 并切分为 9 个文本块。针对 ToolMessage 问题，RRF Top-3 为 `react.md/start=363`（Dense/BM25 均第 1，0.0328）、`react.md/start=0`（均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）；图实际发送给 LLM 的上下文顺序与融合排名一致，答案使用了对应的 `[D1]`、`[D2]`、`[D3]`。这是一条小型语料上的正向端到端验证，不代表系统化检索质量、引用语义或库外拒答评估。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
@@ -181,7 +181,7 @@ LLM API
 - 这些记录证明两次单工具实时天气请求成功，不代表多工具 ReAct 循环、其他城市、异常路径或逐日天气预报已验证。湿度结果与服务端按 0–1 比例格式化的假设相符，但不替代完整 Schema 和边界值检查。地点名“北京市北京”仍有重复，可后续修正展示。
 - 此前输出里的固定“始终晴朗”内容属于旧教学工具，不是实时天气结果。
 
-Agentic RAG 基础路径与引用验收方法已阶段性收口，Subgraph 基础已完成，固定并行与 reducer 已完成，后续进入 Send / Map-Reduce 和 Multi-Agent。质量任务仍包括摘录归属/语义检查、assess 首轮解析失败及调用异常、更广评测。Middleware 重试和 HITL 扩展仍是补充项。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+Agentic RAG 基础路径与引用验收方法已阶段性收口，Subgraph 基础已完成，固定并行与 reducer 已完成，Send / Map-Reduce 三主题基础路径已验证，后续进入 Supervisor / Multi-Agent。质量任务仍包括摘录归属/语义检查、assess 首轮解析失败及调用异常、更广评测。Middleware 重试和 HITL 扩展仍是补充项。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
@@ -197,7 +197,7 @@ prepare 将 user_input 转为 question；父子图共同声明 question 和 answ
 直接通过 `add_node("rag", rag_graph)` 接入；format_result 读取 answer 并整理 final_answer。
 子图的 documents、retrieval_count 等私有字段不自动成为父图输出字段。
 
-2026-10-13，维护者确认包装节点调用与直接注册两种方式已手动运行，知识问题和问候均得到父图最终回答；当前文件只保留直接注册版本。Subgraph 基础完成，固定并行及 reducer 已完成，下一主线 Send / Map-Reduce。
+2026-10-13，维护者确认包装节点调用与直接注册两种方式已手动运行，知识问题和问候均得到父图最终回答；当前文件只保留直接注册版本。Subgraph 基础完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent。
 
 此实验是串行图组合，尚未实现并行、Multi-Agent、父子图 checkpoint 或嵌套流式输出。main 在图运行前建立向量索引，问候也会产生 Embedding 初始化请求；真实运行会访问 Embedding / Chat API。子图沿用 RAG 引用来源错配和评估解析异常的已知限制。
 
@@ -214,7 +214,7 @@ START -> prepare -> explain_concept / give_example -> combine -> END
 维护者于 2026-10-14 提供当前版本结果：分支耗时 53.83s / 55.85s，总耗时约 55.85s，
 合并列表保留 concept 和 example。固定并行及 reducer 已手动验证；不是系统性能基准。
 模型生成内容未经正确性验证，示例不执行。未覆盖单分支失败、限流或超时；未使用 Send、
-checkpoint、并行子图或 Multi-Agent。下一步学习 Send / Map-Reduce。
+checkpoint、并行子图或 Multi-Agent。动态分发已在独立 Map-Reduce 实验中验证。
 
 运行当前实验（两次 Chat 请求可能产生费用，无 Embedding 请求）：
 
@@ -222,17 +222,43 @@ checkpoint、并行子图或 Multi-Agent。下一步学习 Send / Map-Reduce。
 .\.venv\Scripts\python.exe langgraph_parallel_demo.py
 ```
 
+### Send 动态分发与 Map-Reduce
+
+[`langgraph_map_reduce_demo.py`](langgraph_map_reduce_demo.py) 根据本次输入决定任务数量：
+
+```text
+START -> prepare -> Send(explain_topic) × N -> combine -> END
+```
+
+prepare 清理空白、过滤空主题并按首次出现顺序去重；每个 Send 只传入自己的 topic。
+图里只注册一个 explain_topic 节点，每个任务调用一次 Chat 模型，返回单项 results 列表。
+operator.add reducer 拼接这些更新；combine 用 topic 对应结果，按输入主题顺序拼接答案，
+不依赖任务完成顺序，也不额外调用模型。全为空时抛 ValueError。
+
+2026-10-16，维护者提供的三主题运行中，State、Node、Edge 均开始后，按 Node、Edge、State
+顺序完成；combine 收到 3 项，最终按 State、Node、Edge 展示。动态分发与汇总的基础路径
+已手动验证；其他任务数量、空输入、去重和失败路径尚未运行验收。
+
+生成解释未核验准确性，“不超过150字”是提示词约束。当前没有检索证据、显式并发限制、
+失败降级、重试或 checkpoint。每个去重主题请求一次 Chat API，可能产生费用；不调用
+Embedding。下一主线是 Supervisor / Multi-Agent，并行子图作为可选补充。
+
+```powershell
+.\.venv\Scripts\python.exe langgraph_map_reduce_demo.py
+```
+
 ### 实验目录
 
 | 文件 | 学习内容 | 当前状态 |
 | --- | --- | --- |
-| [`langgraph_parallel_demo.py`](langgraph_parallel_demo.py) | 固定分叉、等待汇合、operator.add 合并共享 results | 已由维护者手动验证；下一步 Send / Map-Reduce，异常路径未验证 |
+| [`langgraph_map_reduce_demo.py`](langgraph_map_reduce_demo.py) | Send 动态分发、局部任务输入、列表 reducer 与按主题汇总 | 三主题正常路径已手动验证；更多规模和异常路径未验证 |
+| [`langgraph_parallel_demo.py`](langgraph_parallel_demo.py) | 固定分叉、等待汇合、operator.add 合并共享 results | 已由维护者手动验证；保留固定分支基线，异常路径未验证 |
 | [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步 Hybrid RAG：Dense + BM25 + RRF、State 传递和带引用生成 | 已完成一次端到端正向运行，图内 RRF 名次与模型上下文/D# 顺序一致；更广评测与库外拒答待后续补充 |
 | [`langgraph_bm25_demo.py`](langgraph_bm25_demo.py) | jieba 中文分词与 BM25 关键词 Top-K 检索 | 独立单路基线；3 个库内查询命中相关片段，库外问题仍返回候选 |
 | [`langgraph_hybrid_rag_demo.py`](langgraph_hybrid_rag_demo.py) | Dense + BM25 + RRF 排名融合与可复用 helper | 独立对比入口已验证；`hybrid_retrieve()` 已集成到 RAG StateGraph |
-| [`langgraph_agentic_rag_demo.py`](langgraph_agentic_rag_demo.py) | 固定路由、证据评估、有界重试、编号诊断与人工核对 | 基础验收方法收口；来源错配与解析异常仍保留，Subgraph 基础已完成，固定并行及 reducer 已完成，下一主线 Send / Map-Reduce |
+| [`langgraph_agentic_rag_demo.py`](langgraph_agentic_rag_demo.py) | 固定路由、证据评估、有界重试、编号诊断与人工核对 | 基础验收方法收口；来源错配与解析异常仍保留，Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent |
 | [`tools.py`](tools.py) | 共享工具、权限控制、用户资料读写 | 已使用 |
-| [`langgraph_subgraph_demo.py`](langgraph_subgraph_demo.py) | 父子图组合、共享 question / answer、结果整理 | 两种接入方式由维护者手动验证；当前直接注册版，下一步 Send / Map-Reduce |
+| [`langgraph_subgraph_demo.py`](langgraph_subgraph_demo.py) | 父子图组合、共享 question / answer、结果整理 | 两种接入方式由维护者手动验证；当前直接注册版，后续动态分发见 Map-Reduce 实验 |
 | [`langgraph_react.py`](langgraph_react.py) | 高层 `create_agent` Agent API | 学习实验，存在待修正缺陷 |
 | [`langgraph_state_react.py`](langgraph_state_react.py) | 显式 StateGraph ReAct 和 ToolNode | 已完成基础实验 |
 | [`embedding_test.py`](embedding_test.py) | Embedding、Store 和语义检索 | 已完成最小实验 |
@@ -278,6 +304,7 @@ hello-agents/
 ├── langgraph_agentic_rag_demo.py                # Agentic RAG：规划、证据评估、有界重试与拒答
 ├── langgraph_subgraph_demo.py                  # 父图直接注册 RAG 子图，共享输入输出字段
 ├── langgraph_parallel_demo.py                  # 固定并行与 results 列表 reducer
+├── langgraph_map_reduce_demo.py                # Send 动态分发与 Map-Reduce
 ├── rag_docs/
 │   ├── react.md                                  # RAG 知识库样例
 │   └── stategraph.md                             # RAG 知识库样例
@@ -371,7 +398,7 @@ python -m venv .venv
 语法检查可以使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_subgraph_demo.py langgraph_parallel_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_subgraph_demo.py langgraph_parallel_demo.py langgraph_map_reduce_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
 MCP 命令会启动本地 stdio Server，并请求真实天气 API 和 LLM；可能产生外部请求或费用。运行前需要在根目录 `.env` 配置 `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`QWEATHER_API_HOST` 和 `QWEATHER_API_KEY`。模型、Embedding、搜索和天气工具都可能访问外部 API；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
@@ -432,8 +459,9 @@ Middleware
   -> 固定两步 RAG 的改写问法、跨文档、引用语义及库外拒答扩展评测（可选质量改进）
   -> Subgraph 包装调用与直接注册 [已手动验证，当前保留直接注册版]
   -> 固定并行节点与等待汇合、operator.add reducer [已手动验证，2026-10-14]
-  -> Send / Map-Reduce [下一主线] -> 并行子图 / Multi-Agent
-  -> Supervisor / Multi-Agent
+  -> Send / Map-Reduce [三主题正常路径已手动验证，2026-10-16]
+  -> 并行子图 [可选补充，尚未学习]
+  -> Supervisor / Multi-Agent [下一主线]
   -> Evaluation / Observability
   -> RepoResearcher MVP
   -> DeerFlow 源码对照与工程化演进

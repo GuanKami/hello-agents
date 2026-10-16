@@ -80,6 +80,7 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_agentic_rag_demo.py                       # Agentic RAG：规划、证据评估、有界重试与无证据退出
 ├── langgraph_subgraph_demo.py                         # 父图直接注册 RAG 子图，共享 question / answer
 ├── langgraph_parallel_demo.py                         # 固定并行、等待汇合与 operator.add reducer（已手动验证）
+├── langgraph_map_reduce_demo.py                       # Send 动态分发、列表 reducer 与按主题汇总（已手动验证）
 ├── rag_docs/                                            # RAG 实验用的本地 Markdown 知识库
 │   ├── react.md
 │   └── stategraph.md
@@ -996,13 +997,29 @@ assess 异常要分开记录：已有库外问题第二轮解析失败，在 MAX
 - 当前版本的分支耗时为 53.83s / 55.85s，总耗时约 55.85s；日志先出现两次开始，再完成并汇总，结果保留两种 kind。仅为当前运行观察，不是性能基准或多核 CPU 并行证明。
 - 不依赖结果列表顺序；operator.add 不去重，重复 kind 在汇总字典中覆盖，缺失 kind 会报错。
 - 只使用 Chat API；没有 Embedding、RAG、工具循环、Send、checkpoint、并行子图或 Multi-Agent。模型解释及示例未验证正确性；未验证超时、单分支失败或供应商限流。
-- 下一主线为 Send 动态派发与 Map-Reduce，保留当前实验作为固定分支基线。
+- Send 动态派发已在 4.25 节独立实验验证；保留当前实验作为固定分支基线。
+
+### 4.25 Send / Map-Reduce：`langgraph_map_reduce_demo.py`
+
+结构为 `START -> prepare -> Send(explain_topic) × N -> combine -> END`。
+全图 `MapReduceState` 保存 topics、带 operator.add reducer 的 results 和 final_answer；
+`TopicTask` 是 Send 传入单个任务的局部输入，只包含 topic。
+
+- prepare 去除首尾空白、过滤空主题并按首次出现顺序去重；全为空时抛 ValueError。
+- dispatch_topics 为每个清理后的主题返回一个 Send，同一个 worker 节点运行多次，不动态增加图节点。
+- 每个 worker 调用一次 Chat 模型，只返回本任务的单项 results 列表；operator.add 拼接更新，不负责去重或排序。
+- 当前任务均为一层模型调用；任务完成并合并结果后，combine 按 topic 建立映射，按输入顺序拼接答案，不额外调用模型。
+- **手动验证（2026-10-16，维护者提供日志）**：输入 State、Node、Edge；三个任务均开始后按 Node、Edge、State 顺序完成；combine 收到 3 项，最终按 State、Node、Edge 展示。只覆盖一次三主题正常路径，不代表不同规模、异常路径或性能基准已验证。
+- **限制**：每个去重主题产生一次 Chat 调用，无 Embedding、检索、工具循环或 checkpoint。生成解释未核验，150 字只是提示词约束；无显式并发限制、失败降级或重试。空输入和去重逻辑已实现但未提供运行验收；未来保留重复主题时需要独立任务 ID，当前缺失结果会抛 KeyError。
+- **下一主线**：Supervisor / Multi-Agent；并行子图保留为可选补充，当前实验作为动态分发基线。
 
 ## 5. 学习进度和路线（Learning Roadmap）
 
 ### 5.1 已完成
 
-- **固定并行与 reducer（2026-10-14）**：`langgraph_parallel_demo.py` 已由维护者真实模型手动验证分叉、等待汇合及列表合并；当前版本两个分支写同一 results，按 kind 汇总。Send 动态派发尚未实现。
+- **Send / Map-Reduce（2026-10-16）**：`langgraph_map_reduce_demo.py` 的三主题正常路径已由维护者手动验证动态分发、结果合并和按输入顺序展示；异常及更多任务规模未验证。
+
+- **固定并行与 reducer（2026-10-14）**：`langgraph_parallel_demo.py` 已由维护者真实模型手动验证分叉、等待汇合及列表合并；当前版本两个分支写同一 results，按 kind 汇总。Send 动态派发已在独立 Map-Reduce 实验中完成三主题正常路径验证。
 
 已完成课程学习和可运行实验的内容包括：
 
@@ -1023,8 +1040,8 @@ assess 异常要分开记录：已有库外问题第二轮解析失败，在 MAX
 - RAG 检索观察：Dense 与 BM25 分别召回 Top-3，RRF 按排名融合；已观察分数、各路名次和最终文档顺序。分数不是正确率，少量手动运行不构成跨问题评估。
 - BM25 中文关键词检索（`langgraph_bm25_demo.py`）：3 个知识库内问题检索到相关片段；知识库外 DeerFlow 问题仍返回无关 Top-K，说明 BM25 本身不负责拒答。
 - Dense + BM25 + RRF（`langgraph_hybrid_rag_demo.py`）：独立对比入口仍可观察两路候选及融合排名；`hybrid_retrieve()` 已由固定 RAG 图调用。集成图的 ToolMessage 问题 RRF 名次已验证：react.md start=363（Dense/BM25 均第 1，0.0328）、react.md start=0（均第 2，0.0323）、stategraph.md start=605（Dense 第 3、BM25 未命中，0.0159）。库外问题仍会返回候选。
-- **Agentic RAG 第一版（`langgraph_agentic_rag_demo.py`）**：固定路由、证据评估、有界重试与退出路径已有手动观察；新增编号诊断及人工引用正负向核对方法。基础学习阶段收口，引用来源错配与 assess 解析异常仍保留为质量缺陷，Subgraph 基础已完成，固定并行及 reducer 已完成，下一主线 Send / Map-Reduce。
-- **Subgraph 基础（`langgraph_subgraph_demo.py`）**：维护者确认包装节点输入/输出映射和直接注册共享字段两种方式已手动验证；当前保留直接注册版。下一主线为 Send / Map-Reduce，未验证并行子图或父子图持久化。
+- **Agentic RAG 第一版（`langgraph_agentic_rag_demo.py`）**：固定路由、证据评估、有界重试与退出路径已有手动观察；新增编号诊断及人工引用正负向核对方法。基础学习阶段收口，引用来源错配与 assess 解析异常仍保留为质量缺陷，Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent。
+- **Subgraph 基础（`langgraph_subgraph_demo.py`）**：维护者确认包装节点输入/输出映射和直接注册共享字段两种方式已手动验证；当前保留直接注册版。下一主线为 Supervisor / Multi-Agent，未验证并行子图或父子图持久化。
 - `InMemoryStore` 的进程生命周期限制。
 - **`SqliteStore` 持久化（课程 Notebook 形式，2026-09-10 维护者确认已完成）**：在 `dive-into-langgraph/6.context.ipynb` 第三节中，用 `sqlite3.connect("user-info.db", check_same_thread=False, isolation_level=None)` 建连接，交给 `SqliteStore(conn)` 作为 Store 后端，用 `store.put(("user_info",), key, value)` 预置资料，再在工具内用 `runtime.store.get(("user_info",), user_id)` 读取。已掌握"**Store 后端可替换、长期资料的生命周期由后端决定**"这一机制。
 
@@ -1064,7 +1081,7 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
 
 ### 5.2 当前阶段与执行顺序
 
-2026-10-14 进度更新：Subgraph 基础之后已完成固定并行分叉、汇合及 operator.add reducer 手动验收；下一主线是 Send / Map-Reduce。下文的历史运行记录不代表动态并行已经完成。
+2026-10-16 进度更新：Subgraph、固定并行及 reducer 之后，Send / Map-Reduce 三主题正常路径已手动验证。下一主线是 Supervisor / Multi-Agent；并行子图尚未学习，作为可选补充先不展开，这一顺序调整不代表并行子图已完成。
 
 **计划顺序**（5.3 节）与实际执行顺序：
 
@@ -1079,7 +1096,7 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
        -> BM25 独立检索已运行：3 个库内问题召回相关片段，1 个库外问题仍返回候选
        -> Dense + BM25 + RRF 独立对比已在多个场景运行；融合 helper 已复用到 RAG 图
        -> Agentic RAG 基础路径、引用编号诊断与人工正负向验收方法已收口；保留错配与解析异常限制
-       -> Subgraph 包装调用和直接注册两种方式已手动验证；当前保留直接注册版，固定并行及 reducer 已完成，下一主线 Send / Map-Reduce
+       -> Subgraph 包装调用和直接注册两种方式已手动验证；当前保留直接注册版，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent
 ```
 
 **SqliteStore 这一项的结论（2026-09-10 维护者确认，原"顺序偏离"记录作废）**：
@@ -1090,7 +1107,7 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
 - 将来若需要根目录级别的跨进程长期记忆（例如 HITL 恢复实验，或简历项目要真的记住用户资料），**四个实验都通过 `build_store()` 单点注入 Store**，改这一处即可，不需要重写实验。
 - 该验收的**确认程度**（本地没有 `user-info.db`、Notebook 自带输出中没有一次成功的 SqliteStore 读取）已在 5.1 节据实记录。**不要把这一项描述成"根目录已实测通过"。**
 
-固定两步 Hybrid RAG 与 Agentic RAG 基础阶段按已观察范围收口。固定路由、生成、重试和退出路径已有手动输出，引用编号检查及人工核对已有正负向样例。Subgraph 两种接入方式已由维护者手动验证；固定并行与 reducer 已完成；下一步 Send / Map-Reduce，再学习 Multi-Agent。引用摘录来源仍出现错配，assess 首轮解析失败与模型调用异常未统一恢复；这些是后续质量任务，不应误写为已修复。小型语料和少量手动输出不能证明准确率。Middleware 重试、HITL 扩展和 MCP 多城市/异常覆盖仍是独立补充项。
+固定两步 Hybrid RAG 与 Agentic RAG 基础阶段按已观察范围收口。固定路由、生成、重试和退出路径已有手动输出，引用编号检查及人工核对已有正负向样例。Subgraph 两种接入方式已由维护者手动验证；固定并行与 reducer 已完成；Send / Map-Reduce 基础路径已验证，下一步 Supervisor / Multi-Agent。引用摘录来源仍出现错配，assess 首轮解析失败与模型调用异常未统一恢复；这些是后续质量任务，不应误写为已修复。小型语料和少量手动输出不能证明准确率。Middleware 重试、HITL 扩展和 MCP 多城市/异常覆盖仍是独立补充项。
 
 上下文工程阶段需要理解 State、Context、Store、Runtime 的边界，以及如何从它们构造 Model Context、Tool Context 和生命周期上下文。
 
@@ -1127,14 +1144,14 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
    -> 直接注册编译子图、共享 question / answer [已手动验证；当前代码]
    -> 固定并行节点分叉与等待汇合 [已手动验证]
    -> operator.add reducer 合并共享 results [已手动验证]
-   -> Send 动态派发 / Map-Reduce [下一主线，尚未实现]
-   -> 并行子图 [待学习]
-8. Supervisor / Multi-Agent
+   -> Send 动态派发 / Map-Reduce [三主题正常路径已手动验证，2026-10-16]
+   -> 并行子图 [待学习，可选补充]
+8. Supervisor / Multi-Agent [下一主线]
 9. Evaluation / Observability / Cost / Failure Analysis
 10. Production Architecture 和 DeerFlow 源码阅读
 ```
 
-第 1 步已完成（课程 Notebook 形式），见 5.1 / 5.2 节。当前**不存在未处理的顺序偏离项**；RAG 与 Agentic RAG 的实际推进状态见 4.19–4.22 节。
+第 1 步已完成（课程 Notebook 形式），见 5.1 / 5.2 节。当前先进入 Supervisor / Multi-Agent，并行子图保留为可选补充；RAG 与 Agentic RAG 的实际推进状态见 4.19–4.22 节。
 
 Middleware 放在 Context Engineering 之后，因为中间件经常需要读取和修改 State、Runtime、Prompt、Model 或 Tool 行为。Human-in-the-loop 放在 Middleware 之后，因为中断和恢复依赖可靠的 checkpoint。
 
@@ -1436,7 +1453,7 @@ Store / SqliteStore
 ### 11.1 语法检查
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_subgraph_demo.py langgraph_parallel_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_subgraph_demo.py langgraph_parallel_demo.py langgraph_map_reduce_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
 ### 11.2 LangGraph Agent 实验
@@ -1473,6 +1490,12 @@ Subgraph 独立入口（复用 RAG 初始化，访问 Embedding 和 Chat API）�
 
 ```powershell
 .\.venv\Scripts\python.exe langgraph_parallel_demo.py
+```
+
+Map-Reduce 独立入口（默认三个去重主题，三次 Chat 调用，不调用 Embedding）：
+
+```powershell
+.\.venv\Scripts\python.exe langgraph_map_reduce_demo.py
 ```
 
 ### 11.4 MCP 天气 Agent
@@ -1533,18 +1556,20 @@ Subgraph 独立入口（复用 RAG 初始化，访问 Embedding 和 Chat API）�
 
 ### 12.5 后续学习任务
 
-- **固定并行与 reducer 已完成（2026-10-14）**：当前两条固定分支及结果合并有手动运行证据；下一步 Send / Map-Reduce，按任务标识组织动态结果。失败恢复、限流、并行子图及 Multi-Agent 尚未验证。
+- **Send / Map-Reduce 基础路径已完成（2026-10-16）**：三主题正常运行已观察动态分发、乱序完成、收集 3 项和按输入顺序输出。下一主线 Supervisor / Multi-Agent；并行子图为可选补充，空输入、不同规模、限流和失败恢复尚未验收。
+
+- **固定并行与 reducer 已完成（2026-10-14）**：当前两条固定分支及结果合并有手动运行证据；Send / Map-Reduce 已在独立实验中验证三主题动态分发与按主题汇总。失败恢复、限流、并行子图及 Multi-Agent 尚未验证。
 
 - 使用错误 `thread_id` 完成 Human-in-the-loop 的跨会话负向恢复验证。
 - 验证 Human-in-the-loop 的 `edit` / `respond` 决策，并补充审批身份、超时、审计和幂等设计。
 - **RAG 基础与 Hybrid RAG 集成实验已完成（2026-09-29）**（`langgraph_rag_demo.py`）：2 份 Markdown 切分为 9 块；针对 ToolMessage 问题，维护者提供了 RRF Top-3 的各路名次和图级输出。Top-1 `react.md/start=363` 两路均第 1，Top-2 `react.md/start=0` 两路均第 2，Top-3 `stategraph.md/start=605` 仅 Dense 第 3；实际模型上下文顺序一致，回答使用相应 D# 编号。此结论仅覆盖一条集成正向路径，不代表系统化质量评估。
 - **BM25 独立检索实验已运行观察**（`langgraph_bm25_demo.py`）：3 个知识库内问题召回相关片段，询问 DeerFlow 长期记忆数据库时仍返回无关 Top-K；BM25 不具备自动拒答能力。
 - **Dense + BM25 + RRF 对比已完成并集成**（`langgraph_hybrid_rag_demo.py`）：独立入口保留检索器对比；`hybrid_retrieve()` 已由 `langgraph_rag_demo.py` 调用。知识库外问题仍可能返回无关候选，RRF 不负责答案存在性判断。
-- **Agentic RAG 当前实现状态**：基础路径、编号检查与人工正负向验收方法阶段性收口（2026-10-13）；当前Subgraph 基础已完成，固定并行及 reducer 已完成，下一主线 Send / Map-Reduce。代码仅提供引用诊断，没有语义自动校验或错误答案拦截。
+- **Agentic RAG 当前实现状态**：基础路径、编号检查与人工正负向验收方法阶段性收口（2026-10-13）；当前Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent。代码仅提供引用诊断，没有语义自动校验或错误答案拦截。
 - **保留的 Agentic RAG 质量缺陷**：真实答案将本轮 D2 的 Edge 原文标成 D1；有效编号检查无法识别。assess 上限处解析失败保守退出已观察，但首轮解析失败、调用异常和更广评测仍待完善。
-- 后续用引用错配失败样例完善摘录归属、逐条语义支持检查及评估异常处理；当前 Subgraph 基础已完成，转向 Send / Map-Reduce，然后 Multi-Agent。不要把验收方法完成记为引用正确性稳定。
+- 后续用引用错配失败样例完善摘录归属、逐条语义支持检查及评估异常处理；当前 Subgraph 基础已完成，Send / Map-Reduce 基础路径已验证，转向 Supervisor / Multi-Agent。不要把验收方法完成记为引用正确性稳定。
 - 固定两步 Hybrid RAG 的可选质量扩展：扩大改写问法、跨文档、引用语义、库外拒答和检索失败的图级评估；D# 仍是本次上下文中的临时编号，不是稳定文档 ID；Top-K/RRF 排名和编号白名单不能替代答案存在性判断与引用语义校验。这些基础 RAG 的广泛评测不阻塞后续章节；Agentic RAG 的当前未完成验收点按 5.3 节处理，不能再把已接入的证据充分性节点记为待实现。
-- **Subgraph 基础已完成（2026-10-13）**：两种接入方式已由维护者手动验证，当前文件保留共享字段直接注册版。固定并行与 reducer 已完成；下一步 Send / Map-Reduce，再学习并行子图及 Supervisor/Multi-Agent；checkpoint 和嵌套流式输出仍未覆盖。
+- **Subgraph 基础已完成（2026-10-13）**：两种接入方式已由维护者手动验证，当前文件保留共享字段直接注册版。固定并行与 reducer 已完成；Send / Map-Reduce 基础路径已验证；下一步 Supervisor/Multi-Agent，并行子图作为可选补充；checkpoint 和嵌套流式输出仍未覆盖。
 - 选择最终简历项目的真实业务场景。
 - 建立评估数据、Trace、成本统计和失败分析机制。
 - 在具备足够基础后，开始按组件阅读 DeerFlow 源码，并记录架构对照笔记。
