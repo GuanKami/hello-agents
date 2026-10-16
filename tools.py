@@ -131,6 +131,11 @@ def save_user_info(user_info: UserInfo, runtime: ToolRuntime[Context]) -> str:
     return "成功保存用户信息"
 
 @tool
-def divide(a: int, b: int) -> float:
-    """计算两个数字的商。"""
+def divide(a: float, b: float) -> float:
+    """计算 a 除以 b；除数不能为零。"""
+    print(f"[divide] 执行：{a} / {b}")
+
+    if b == 0:
+        raise ValueError("除数不能为 0")
+
     return a / b

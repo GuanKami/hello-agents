@@ -6,7 +6,7 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 10 月 16 日，LangGraph 基础、Memory、Context Engineering、Middleware、HITL、MCP 与基础 Hybrid RAG 已完成相关实验。Agentic RAG 基础路径、编号检查及人工引用正负向核对方法已阶段性收口，Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent；引用来源错配、assess 解析异常和更广评测仍是已知限制。
+> 截至 2026 年 10 月 16 日，LangGraph 基础、Memory、Context Engineering、Middleware、HITL、MCP 与基础 Hybrid RAG 已完成相关实验。Agentic RAG 基础路径、编号检查及人工引用正负向核对方法已阶段性收口，Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，Supervisor / Multi-Agent 三条基础路径已手动验证，下一主线 Evaluation / Observability；引用来源错配、assess 解析异常和更广评测仍是已知限制。
 >
 > 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 Hybrid RAG 输出读取 2 份 Markdown 并切分为 9 个文本块。针对 ToolMessage 问题，RRF Top-3 为 `react.md/start=363`（Dense/BM25 均第 1，0.0328）、`react.md/start=0`（均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）；图实际发送给 LLM 的上下文顺序与融合排名一致，答案使用了对应的 `[D1]`、`[D2]`、`[D3]`。这是一条小型语料上的正向端到端验证，不代表系统化检索质量、引用语义或库外拒答评估。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
@@ -181,7 +181,7 @@ LLM API
 - 这些记录证明两次单工具实时天气请求成功，不代表多工具 ReAct 循环、其他城市、异常路径或逐日天气预报已验证。湿度结果与服务端按 0–1 比例格式化的假设相符，但不替代完整 Schema 和边界值检查。地点名“北京市北京”仍有重复，可后续修正展示。
 - 此前输出里的固定“始终晴朗”内容属于旧教学工具，不是实时天气结果。
 
-Agentic RAG 基础路径与引用验收方法已阶段性收口，Subgraph 基础已完成，固定并行与 reducer 已完成，Send / Map-Reduce 三主题基础路径已验证，后续进入 Supervisor / Multi-Agent。质量任务仍包括摘录归属/语义检查、assess 首轮解析失败及调用异常、更广评测。Middleware 重试和 HITL 扩展仍是补充项。具体状态以 [AGENTS.md](AGENTS.md) 为准。
+Agentic RAG 基础路径与引用验收方法已阶段性收口，Subgraph 基础已完成，固定并行与 reducer 已完成，Send / Map-Reduce 三主题基础路径已验证，Supervisor / Multi-Agent 三条基础路径已验证，后续进入 Evaluation / Observability。质量任务仍包括摘录归属/语义检查、assess 首轮解析失败及调用异常、更广评测。Middleware 重试和 HITL 扩展仍是补充项。具体状态以 [AGENTS.md](AGENTS.md) 为准。
 
 ## 实验文件
 
@@ -197,7 +197,7 @@ prepare 将 user_input 转为 question；父子图共同声明 question 和 answ
 直接通过 `add_node("rag", rag_graph)` 接入；format_result 读取 answer 并整理 final_answer。
 子图的 documents、retrieval_count 等私有字段不自动成为父图输出字段。
 
-2026-10-13，维护者确认包装节点调用与直接注册两种方式已手动运行，知识问题和问候均得到父图最终回答；当前文件只保留直接注册版本。Subgraph 基础完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent。
+2026-10-13，维护者确认包装节点调用与直接注册两种方式已手动运行，知识问题和问候均得到父图最终回答；当前文件只保留直接注册版本。Subgraph 基础完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，Supervisor / Multi-Agent 三条基础路径已手动验证，下一主线 Evaluation / Observability。
 
 此实验是串行图组合，尚未实现并行、Multi-Agent、父子图 checkpoint 或嵌套流式输出。main 在图运行前建立向量索引，问候也会产生 Embedding 初始化请求；真实运行会访问 Embedding / Chat API。子图沿用 RAG 引用来源错配和评估解析异常的已知限制。
 
@@ -241,22 +241,61 @@ operator.add reducer 拼接这些更新；combine 用 topic 对应结果，按�
 
 生成解释未核验准确性，“不超过150字”是提示词约束。当前没有检索证据、显式并发限制、
 失败降级、重试或 checkpoint。每个去重主题请求一次 Chat API，可能产生费用；不调用
-Embedding。下一主线是 Supervisor / Multi-Agent，并行子图作为可选补充。
+Embedding。Supervisor / Multi-Agent 基础已验证，下一主线是 Evaluation / Observability，并行子图作为可选补充。
 
 ```powershell
 .\.venv\Scripts\python.exe langgraph_map_reduce_demo.py
 ```
 
+### Supervisor / Multi-Agent：专家作为工具
+
+`langgraph_supervisor_demo.py` 由主 Agent 选择专家，并利用专家结果组织回答：
+
+```text
+用户 -> Supervisor -> ask_knowledge_agent -> 现有 Agentic RAG -> answer
+                  -> ask_math_agent -> 数学 Agent -> divide -> 计算回答
+                 <- 两个专家的结果作为 ToolMessage 返回
+     <- Supervisor 最终回答
+```
+
+专家仅接收本次子任务，返回答案文本；父会话不会自动传入专家，专家的完整 State 和
+内部工具消息也不会自动返回父会话。多个角色共用模型客户端，分别配置提示词与工具。
+create_agent 在内部组织模型调用、工具执行和回到模型的循环。
+
+2026-10-16，维护者提供的三条真实运行均符合预期：
+
+| 输入场景 | 实际行为 |
+| --- | --- |
+| 解释 StateGraph 中 Node 的职责 | 只调用知识专家，经 RAG 返回带引用答案 |
+| 计算 2246 除以 10 | 只调用数学专家，执行 divide，返回 224.6 |
+| 同时解释 Node 并计算除法 | 同轮调用两个专家，接收结果后汇总；日志观察到执行重叠 |
+
+这是三条正常路径的手动验证，不代表通用路由准确率或异常恢复已验证。知识专家的 D#
+仍属于单次检索上下文，返回文本没有独立来源映射；RAG 的引用错配和 assess 解析异常
+仍可能发生。没有配置 checkpoint、统一专家异常转换、显式超时或总 API 请求预算；
+recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，此路径未验收。
+
+main 默认运行混合问题；修改 question 可复跑单任务。启动均会建立内存向量索引，
+因此纯计算或寒暄也有 Embedding 初始化请求，运行还会产生多次 Chat 请求。
+
+```powershell
+.\.venv\Scripts\python.exe langgraph_supervisor_demo.py
+```
+
+下一阶段为 Evaluation / Observability：先比较固定用例的预期/实际专家选择，记录异常、
+最终答案和总耗时。该评估脚本尚未实现，证据支持度需要独立核对。
+
 ### 实验目录
 
 | 文件 | 学习内容 | 当前状态 |
 | --- | --- | --- |
+| `langgraph_supervisor_demo.py` | 专家作为工具、子任务上下文、结果回传与主 Agent 汇总 | 仅知识、仅数学、混合任务三条正常路径已手动验证；下一步评估与可观测性 |
 | [`langgraph_map_reduce_demo.py`](langgraph_map_reduce_demo.py) | Send 动态分发、局部任务输入、列表 reducer 与按主题汇总 | 三主题正常路径已手动验证；更多规模和异常路径未验证 |
 | [`langgraph_parallel_demo.py`](langgraph_parallel_demo.py) | 固定分叉、等待汇合、operator.add 合并共享 results | 已由维护者手动验证；保留固定分支基线，异常路径未验证 |
 | [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步 Hybrid RAG：Dense + BM25 + RRF、State 传递和带引用生成 | 已完成一次端到端正向运行，图内 RRF 名次与模型上下文/D# 顺序一致；更广评测与库外拒答待后续补充 |
 | [`langgraph_bm25_demo.py`](langgraph_bm25_demo.py) | jieba 中文分词与 BM25 关键词 Top-K 检索 | 独立单路基线；3 个库内查询命中相关片段，库外问题仍返回候选 |
 | [`langgraph_hybrid_rag_demo.py`](langgraph_hybrid_rag_demo.py) | Dense + BM25 + RRF 排名融合与可复用 helper | 独立对比入口已验证；`hybrid_retrieve()` 已集成到 RAG StateGraph |
-| [`langgraph_agentic_rag_demo.py`](langgraph_agentic_rag_demo.py) | 固定路由、证据评估、有界重试、编号诊断与人工核对 | 基础验收方法收口；来源错配与解析异常仍保留，Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，下一主线 Supervisor / Multi-Agent |
+| [`langgraph_agentic_rag_demo.py`](langgraph_agentic_rag_demo.py) | 固定路由、证据评估、有界重试、编号诊断与人工核对 | 基础验收方法收口；来源错配与解析异常仍保留，Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，Supervisor / Multi-Agent 三条基础路径已手动验证，下一主线 Evaluation / Observability |
 | [`tools.py`](tools.py) | 共享工具、权限控制、用户资料读写 | 已使用 |
 | [`langgraph_subgraph_demo.py`](langgraph_subgraph_demo.py) | 父子图组合、共享 question / answer、结果整理 | 两种接入方式由维护者手动验证；当前直接注册版，后续动态分发见 Map-Reduce 实验 |
 | [`langgraph_react.py`](langgraph_react.py) | 高层 `create_agent` Agent API | 学习实验，存在待修正缺陷 |
@@ -305,6 +344,7 @@ hello-agents/
 ├── langgraph_subgraph_demo.py                  # 父图直接注册 RAG 子图，共享输入输出字段
 ├── langgraph_parallel_demo.py                  # 固定并行与 results 列表 reducer
 ├── langgraph_map_reduce_demo.py                # Send 动态分发与 Map-Reduce
+├── langgraph_supervisor_demo.py                # Supervisor 委派知识与数学专家
 ├── rag_docs/
 │   ├── react.md                                  # RAG 知识库样例
 │   └── stategraph.md                             # RAG 知识库样例
@@ -379,6 +419,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe langgraph_hybrid_rag_demo.py
 .\.venv\Scripts\python.exe langgraph_agentic_rag_demo.py
 .\.venv\Scripts\python.exe langgraph_subgraph_demo.py
+.\.venv\Scripts\python.exe langgraph_supervisor_demo.py
 .\.venv\Scripts\python.exe langgraph_context_demo.py
 .\.venv\Scripts\python.exe langgraph_state_context_demo.py
 .\.venv\Scripts\python.exe langgraph_middleware_dynamic_prompt_demo.py
@@ -398,7 +439,7 @@ python -m venv .venv
 语法检查可以使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_subgraph_demo.py langgraph_parallel_demo.py langgraph_map_reduce_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
+.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_subgraph_demo.py langgraph_parallel_demo.py langgraph_map_reduce_demo.py langgraph_supervisor_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
 MCP 命令会启动本地 stdio Server，并请求真实天气 API 和 LLM；可能产生外部请求或费用。运行前需要在根目录 `.env` 配置 `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`QWEATHER_API_HOST` 和 `QWEATHER_API_KEY`。模型、Embedding、搜索和天气工具都可能访问外部 API；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
@@ -461,8 +502,8 @@ Middleware
   -> 固定并行节点与等待汇合、operator.add reducer [已手动验证，2026-10-14]
   -> Send / Map-Reduce [三主题正常路径已手动验证，2026-10-16]
   -> 并行子图 [可选补充，尚未学习]
-  -> Supervisor / Multi-Agent [下一主线]
-  -> Evaluation / Observability
+  -> Supervisor / Multi-Agent [三条基础路径已手动验证，2026-10-16]
+  -> Evaluation / Observability [下一主线，尚未实现]
   -> RepoResearcher MVP
   -> DeerFlow 源码对照与工程化演进
 ```
