@@ -6,7 +6,7 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 10 月 16 日，LangGraph 基础、Memory、Context Engineering、Middleware、HITL、MCP 与基础 Hybrid RAG 已完成相关实验。Agentic RAG 基础路径、编号检查及人工引用正负向核对方法已阶段性收口，Subgraph 基础已完成，固定并行及 reducer 已完成，Send / Map-Reduce 基础路径已手动验证，Supervisor / Multi-Agent 三条基础路径已手动验证，下一主线 Evaluation / Observability；引用来源错配、assess 解析异常和更广评测仍是已知限制。
+> 截至 2026 年 10 月 19 日，LangGraph 基础、Memory、Context Engineering、Middleware、HITL、MCP 与基础 Hybrid RAG 已完成相关实验。Agentic RAG 基础路径及引用核对方法已阶段性收口，Subgraph、固定并行与 reducer、Send / Map-Reduce、Supervisor 基础路径已手动验证。Evaluation / Observability 已开始，Supervisor 三用例批量流程与文本断言本次 3/3；下一步保存评估报告。引用来源错配、解析异常、评估异常分支和更广评测仍待完善。
 >
 > 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 Hybrid RAG 输出读取 2 份 Markdown 并切分为 9 个文本块。针对 ToolMessage 问题，RRF Top-3 为 `react.md/start=363`（Dense/BM25 均第 1，0.0328）、`react.md/start=0`（均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）；图实际发送给 LLM 的上下文顺序与融合排名一致，答案使用了对应的 `[D1]`、`[D2]`、`[D3]`。这是一条小型语料上的正向端到端验证，不代表系统化检索质量、引用语义或库外拒答评估。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
@@ -275,21 +275,33 @@ create_agent 在内部组织模型调用、工具执行和回到模型的循环�
 仍可能发生。没有配置 checkpoint、统一专家异常转换、显式超时或总 API 请求预算；
 recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，此路径未验收。
 
-main 默认运行混合问题；修改 question 可复跑单任务。启动均会建立内存向量索引，
+main 默认依次运行 EVALUATION_CASES 三条用例，共用初始化索引和 Supervisor。
+各用例只传入新消息，没有 checkpoint 会话延续。启动均会建立内存向量索引，
 因此纯计算或寒暄也有 Embedding 初始化请求，运行还会产生多次 Chat 请求。
 
 ```powershell
 .\.venv\Scripts\python.exe langgraph_supervisor_demo.py
 ```
 
-下一阶段为 Evaluation / Observability：先比较固定用例的预期/实际专家选择，记录异常、
-最终答案和总耗时。该评估脚本尚未实现，证据支持度需要独立核对。
+2026-10-19，维护者提供批量流程与最小业务文本检查 **3/3**。
+evaluate_case 比较专家集合、工具请求/返回 ID 集合与显式错误状态、最终回答；
+check_business_answer 检查知识用例中的 Node、State、字段/状态更新及 D1-D3 标记，
+数学用例中的 224.6 和没有“失败”字样，混合用例中的 Node 和 224.6。
+曾出现 Supervisor 丢失引用，强化提示词后本次复跑通过；不代表长期稳定或语义正确。
+run_evaluation 返回内存报告，记录调用次数、答案和单用例耗时，不含启动建索引。
+Evaluation / Observability 已开始，下一步保存 JSON 报告；Trace、Token/成本尚未实现。
+
+评估限制：父层消息不证明内部 divide 成功，专家集合不限制重复调用；子串规则
+可能误判（StateGraph 命中 State、更长数字命中 224.6），未知用例空断言会通过。
+引用标记存在不证明来源合法或支持结论，混合用例未检查引用。
+异常报告缺少 business_check，但异常打印仍访问它，可能再次抛 KeyError；
+汇总后的业务明细仅属于最后一条用例。本次仅记录，未修改这些执行逻辑。
 
 ### 实验目录
 
 | 文件 | 学习内容 | 当前状态 |
 | --- | --- | --- |
-| `langgraph_supervisor_demo.py` | 专家作为工具、子任务上下文、结果回传与主 Agent 汇总 | 仅知识、仅数学、混合任务三条正常路径已手动验证；下一步评估与可观测性 |
+| `langgraph_supervisor_demo.py` | 专家委派与批量验收 | 三条基础路径已手动验证；2026-10-19 流程及文本断言 3/3，报告保存和异常覆盖待做 |
 | [`langgraph_map_reduce_demo.py`](langgraph_map_reduce_demo.py) | Send 动态分发、局部任务输入、列表 reducer 与按主题汇总 | 三主题正常路径已手动验证；更多规模和异常路径未验证 |
 | [`langgraph_parallel_demo.py`](langgraph_parallel_demo.py) | 固定分叉、等待汇合、operator.add 合并共享 results | 已由维护者手动验证；保留固定分支基线，异常路径未验证 |
 | [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步 Hybrid RAG：Dense + BM25 + RRF、State 传递和带引用生成 | 已完成一次端到端正向运行，图内 RRF 名次与模型上下文/D# 顺序一致；更广评测与库外拒答待后续补充 |
@@ -503,7 +515,7 @@ Middleware
   -> Send / Map-Reduce [三主题正常路径已手动验证，2026-10-16]
   -> 并行子图 [可选补充，尚未学习]
   -> Supervisor / Multi-Agent [三条基础路径已手动验证，2026-10-16]
-  -> Evaluation / Observability [下一主线，尚未实现]
+  -> Evaluation / Observability [基础批量检查 3/3；报告保存、Trace/成本和异常覆盖待做]
   -> RepoResearcher MVP
   -> DeerFlow 源码对照与工程化演进
 ```
