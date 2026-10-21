@@ -31,12 +31,17 @@ Supervisor 整理最终回答
     build_supervisor 闭包保存 RAG 图和计算 Agent，两个 @tool 暴露专家入口。
     父 Agent 仅收到专家答案；create_agent 内部组织模型、工具和返回模型的循环。
     evaluate_case 检查专家集合、工具返回 ID、最终回答与文本断言；
-    run_evaluation 记录耗时并返回内存报告列表，尚未保存文件。
+    run_evaluation 逐条打印检查并返回报告；save_evaluation_report 保存 JSON。
+    handle_math_tool_error 已定义，但当前未注册到数学专家，尚不生效。
 验证方式：
     2026-10-16，维护者提供三条真实运行：知识问题仅调用知识专家；除法仅调用
     数学专家并执行 divide；混合问题调用两个专家后汇总，观察到专家执行重叠。
     2026-10-19，维护者提供批量汇总 3/3，当前流程检查与最小业务断言通过。
-    main 默认顺序运行 EVALUATION_CASES 三条真实模型用例，不是确定性测试。
+    2026-10-20，三用例 JSON 报告 3/3，知识和混合答案均保留 [D2]。
+    2026-10-21，寒暄与库外问题 2/2，库外问题两次评估不足后正常退出。
+    除零报告 1/1 仅证明专家选择与错误说明；日志未证明 divide 执行。
+    main 当前配置六条用例，未提供同批六条全部通过的证据。
+    历史报告保留限流及评估解析异常；成功复跑不证明异常已修复。
     曾出现 Supervisor 汇总丢失引用；强化保留引用的提示词后，本次复跑通过。
 学习总结：
     工具接口内部可以运行完整 Agent 或编译子图。多个角色可共用模型客户端，
@@ -50,16 +55,26 @@ Supervisor 整理最终回答
     启动总会建立内存向量索引，纯计算或寒暄也有 Embedding 初始化请求。
     评估仅看父层消息，不验证内部 divide；集合比较不限制专家重复调用。
     文本断言较粗：State 可命中 StateGraph，224.6 可命中更长数字；
-    D1-D3 仅检查标记存在，混合用例未检查引用；未知用例的空断言会通过。
-    异常报告缺少 business_check，但打印分支仍访问它，可能再次抛 KeyError；
-    汇总后的业务明细只对应最后一条用例。这些路径尚未修复或运行验收。
+    知识和混合用例正则提取 [D数字]，不验证来源或语义；库外/除零检查仅看短语。
+    invoke 异常已记录且跳过正常打印；未知用例会抛 ValueError，不再空检查通过。
+    消息处理、业务检查与写文件错误不在 invoke 的 try 范围内，仍可能中断整批。
+    内部工具消息仅打印，不进入报告；数学异常 wrapper 未注册，异常链未验收。
 后续优化方向：
-    保存本地报告，修正异常报告与逐用例打印，再补充边界用例、来源和调用预算。
+    注册并验收数学异常 wrapper，将内部工具证据纳入报告，再补充来源、预算、
+    Trace 与 Token/成本；保留成功及失败报告作为回归记录。
 """
 import os
-
+import re
+import json
+from datetime import datetime
+from pathlib import Path
 from time import perf_counter
 from dotenv import load_dotenv
+from collections.abc import Callable
+
+from langchain.agents.middleware import wrap_tool_call
+from langchain.tools.tool_node import ToolCallRequest
+from langgraph.types import Command
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
@@ -77,6 +92,8 @@ from langgraph_hybrid_rag_demo import (
 
 from tools import divide
 
+# 六条用例包括正常任务、寒暄、库外问题和除零错误说明。
+# 除零 PASS 不能证明内部 divide 或异常 wrapper 执行。
 # 专家集合只检查选择范围，不约束调用顺序或重复调用次数。
 EVALUATION_CASES = [
     {
@@ -96,6 +113,21 @@ EVALUATION_CASES = [
             "ask_knowledge_agent",
             "ask_math_agent",
         },
+    },
+    {
+        "name": "寒暄",
+        "question": "你好。",
+        "expected_tools": set(),
+    },
+    {
+        "name": "知识库无答案",
+        "question": "DeerFlow 使用什么数据库保存长期记忆？",
+        "expected_tools": {"ask_knowledge_agent"},
+    },
+    {
+        "name": "除零异常",
+        "question": "请计算 10 除以 0。",
+        "expected_tools": {"ask_math_agent"},
     },
 ]
 
@@ -148,6 +180,7 @@ def evaluate_case(supervisor, case: dict) -> dict:
         for message in tool_messages
     }
 
+    # 父层专家正常返回和内部 divide 失败可以同时存在；寒暄空集合闭环也通过。
     tool_results_ok = (
         call_ids == returned_ids
         and all(
@@ -188,7 +221,7 @@ def evaluate_case(supervisor, case: dict) -> dict:
     }
 
 def run_evaluation(supervisor) -> list[dict]:
-    """顺序运行固定用例，返回内存报告；真实模型结果可能波动。"""
+    """顺序运行固定用例，逐条打印检查结果，并返回报告列表。"""
     reports = []
 
     for case in EVALUATION_CASES:
@@ -197,11 +230,9 @@ def run_evaluation(supervisor) -> list[dict]:
         report = evaluate_case(supervisor, case)
         reports.append(report)
 
+        # 异常报告没有 business_check 等正常结果字段。
+        # 打印异常后跳过本轮，继续运行下一条用例。
         if report["error_type"]:
-            # 已知缺陷：异常报告不存在 business_check，此处可能抛 KeyError。
-            print("业务结果检查：", report["business_check"]["checks"])
-            print("业务结果通过：", report["business_check"]["passed"])
-            print("结果：", "PASS" if report["passed"] else "FAIL")
             print("结果：FAIL")
             print("异常类型：", report["error_type"])
             print("耗时：", report["elapsed_s"], "秒")
@@ -213,39 +244,41 @@ def run_evaluation(supervisor) -> list[dict]:
         print("专家选择正确：", report["routing_ok"])
         print("工具结果完整：", report["tool_results_ok"])
         print("存在最终回答：", report["final_answer_ok"])
+
+        # 放在循环内，打印当前这一条用例的业务检查明细。
+        print("业务结果检查：", report["business_check"]["checks"])
+        print("业务结果通过：", report["business_check"]["passed"])
+        print("提取到的引用：", report["business_check"]["citation_ids"])
+
         print("耗时：", report["elapsed_s"], "秒")
         print("结果：", "PASS" if report["passed"] else "FAIL")
 
         print("\n=== Agent 最终回答 ===")
         print(report["answer"])
 
+    # 循环结束后只打印整批统计。
     passed_count = sum(report["passed"] for report in reports)
 
     print("\n=== 批量验收汇总 ===")
     print(f"通过：{passed_count}/{len(reports)}")
-    # report 此时是最后一条用例，以下两行不是整批的业务明细。
-    print("业务结果检查：", report["business_check"]["checks"])
-    print("业务结果通过：", report["business_check"]["passed"])
 
     return reports
 
 def check_business_answer(case: dict, answer: str) -> dict:
-    """固定三条用例的文本冒烟检查，不验证完整语义或引用证据支持度。"""
-    checks: dict[str, bool] = {}
-    # 子串规则可能误判；新增用例必须同步补充，否则 all([]) 会返回 True。
+    """检查固定用例的最小文本要求，不验证引用来源及语义支持度。"""
+    # 提取 [D1]、[D2] 等标准标记；[1][2] 不会匹配。
+    citation_ids = sorted(set(re.findall(r"\[D[1-9][0-9]*\]", answer)))
+    has_citation = bool(citation_ids)
 
     if case["name"] == "只问知识":
         checks = {
             "包含 Node": "Node" in answer,
-            "包含 State": "State" in answer,
+            "包含 State 或状态": "State" in answer or "状态" in answer,
             "包含字段更新": (
                 "字段更新" in answer
                 or "状态更新" in answer
             ),
-            "包含引用": any(
-                citation in answer
-                for citation in ("[D1]", "[D2]", "[D3]")
-            ),
+            "包含标准引用标记": has_citation,
         }
 
     elif case["name"] == "只做计算":
@@ -258,16 +291,171 @@ def check_business_answer(case: dict, answer: str) -> dict:
         checks = {
             "包含 Node": "Node" in answer,
             "包含计算结果": "224.6" in answer,
+            "包含标准引用标记": has_citation,
         }
+
+    elif case["name"] == "寒暄":
+        checks = {
+            "回答非空": bool(answer.strip()),
+            "包含问候": any(
+                word in answer
+                for word in ("你好", "您好", "嗨", "哈喽")
+            ),
+            "没有检索引用标记": not has_citation,
+        }
+
+    elif case["name"] == "知识库无答案":
+        # 只检查是否表达资料不足；仍需人工阅读，确认没有同时补编答案。
+        insufficient_phrases = (
+            "证据不足",
+            "足够证据",
+            "资料不足",
+            "信息不足",
+            "没有找到",
+            "未找到",
+            "未提及",
+            "未说明",
+            "无法确定",
+            "无法确认",
+        )
+
+        checks = {
+            "回答非空": bool(answer.strip()),
+            "说明资料或证据不足": any(
+                phrase in answer
+                for phrase in insufficient_phrases
+            ),
+        }
+
+    elif case["name"] == "除零异常":
+        # 只检查错误说明；模型直接回答常识也可能通过，不能替代工具执行证据。
+        mentions_zero_division = any(
+            phrase in answer
+            for phrase in (
+                "除数不能为 0",
+                "除数不能为0",
+                "除数为零",
+                "除以零",
+                "除以 0",
+            )
+        )
+
+        explains_failure = any(
+            phrase in answer
+            for phrase in (
+                "无法计算",
+                "不能计算",
+                "不能为",
+                "未定义",
+                "没有定义",
+                "失败",
+            )
+        )
+
+        checks = {
+            "回答非空": bool(answer.strip()),
+            "说明除零原因": mentions_zero_division,
+            "说明无法计算": explains_failure,
+        }
+
+    else:
+        # 新增用例却没有配置断言时，明确报错，避免空检查自动通过。
+        raise ValueError(f"尚未配置业务检查：{case['name']}")
 
     return {
         "passed": all(checks.values()),
         "checks": checks,
+        "citation_ids": citation_ids,
     }
+
+def save_evaluation_report(
+    reports: list[dict],
+    *,
+    model_name: str,
+    started_at: datetime,
+    batch_elapsed_s: float,
+) -> Path:
+    """保存本批验收记录；仅记录模型名称，不保存密钥或服务地址。"""
+    report_dir = Path(__file__).resolve().parent / "evaluation_reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    # 微秒用于区分短时间内连续运行的报告。
+    run_id = started_at.strftime("%Y%m%d_%H%M%S_%f")
+    report_path = report_dir / f"supervisor_{run_id}.json"
+
+    passed_count = sum(report["passed"] for report in reports)
+
+    payload = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "model_name": model_name,
+        "summary": {
+            "total": len(reports),
+            "passed": passed_count,
+            "failed": len(reports) - passed_count,
+            "batch_elapsed_s": round(batch_elapsed_s, 2),
+        },
+        "cases": reports,
+    }
+
+    # 报告不含问题、内部工具消息、来源映射及 Token/Trace；异常报告结构较精简。
+    # x 模式避免意外覆盖已经存在的报告。
+    with report_path.open("x", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+
+    print("\n=== 评估报告已保存 ===")
+    print(report_path)
+
+    return report_path
+
+@wrap_tool_call
+def handle_math_tool_error(
+    request: ToolCallRequest,
+    handler: Callable[[ToolCallRequest], ToolMessage | Command],
+) -> ToolMessage | Command:
+    """拟转换 divide 的已知除零 ValueError；当前未注册，尚不生效。
+
+    与旧实验的 ZeroDivisionError 不同，当前 tools.py 主动抛 ValueError。
+    只有注册到数学专家的 middleware 后，才能进入真实工具执行链。
+    """
+    tool_call = request.tool_call
+
+    try:
+        return handler(request)
+
+    except ValueError as exc:
+        # 精确对应 tools.py 当前主动抛出的业务异常。
+        is_division_by_zero = (
+            tool_call["name"] == "divide"
+            and str(exc) == "除数不能为 0"
+        )
+
+        if not is_division_by_zero:
+            raise
+
+        print(
+            "[math_tool_error] 捕获除零异常："
+            f"tool={tool_call['name']}, "
+            f"args={tool_call['args']}, "
+            f"tool_call_id={tool_call['id']}"
+        )
+
+        return ToolMessage(
+            content=(
+                "工具执行失败：除数不能为 0，无法计算。"
+                "请说明失败原因，不要重试相同参数，也不要编造数值结果。"
+            ),
+            name=tool_call["name"],
+            tool_call_id=tool_call["id"],
+            status="error",
+        )
 
 def build_supervisor(llm, rag_graph):
     # 构建时不执行任务；数学专家有自己的消息输入和工具循环。
     # 主 Agent 不直接持有 divide，只能通过专家工具委派。
+    # 当前缺少 middleware=[handle_math_tool_error]，定义 wrapper 不会自动注册。
     math_agent = create_agent(
         model=llm,
         tools=[divide],
@@ -281,7 +469,10 @@ def build_supervisor(llm, rag_graph):
 
     @tool
     def ask_knowledge_agent(question: str) -> str:
-        """查询本地知识库，回答 LangGraph、StateGraph、ReAct 相关知识问题。"""
+        """
+        查询本地知识库中的 LangGraph、StateGraph、ReAct 知识；
+        DeerFlow 实现问题也交由此入口核查，资料不足时返回无法回答。
+        """
         print(f"[knowledge_agent] 开始：{question}")
 
         # 只传入子任务，父 Agent 的完整会话不会自动进入子图上下文。
@@ -307,6 +498,16 @@ def build_supervisor(llm, rag_graph):
             ],
         })
 
+        # 内部工具状态仅打印，父层验收报告看不到这些消息。
+        for message in result["messages"]:
+            if isinstance(message, ToolMessage):
+                print(
+                    f"[math_agent tool] name={message.name}, "
+                    f"status={message.status}, "
+                    f"tool_call_id={message.tool_call_id}"
+                )
+                print("[math_agent tool] content =", message.content)
+
         print("[math_agent] 完成")
 
         # 取专家的最后一条回答，不返回其完整内部工具循环。
@@ -330,6 +531,12 @@ def build_supervisor(llm, rag_graph):
             "整理知识库结果时保留引用编号及其对应结论，不重新分配编号。"
             "知识专家返回带引用的结论时，最终回答必须保留对应的 [D数字] 引用，"
             "可以精简文字，但不得省略引用编号，也不得添加专家未提供的引用。"
+            "关于 DeerFlow 的实现或存储问题，也必须先调用 ask_knowledge_agent"
+            "查询本地资料，不根据模型记忆自行回答。"
+            "专家返回资料或证据不足时，最终回答明确说明本地资料不足，"
+            "不得继续猜测具体数据库或实现方案。"
+            "数学专家报告无法计算或工具执行失败时，"
+            "如实转述原因，不自行计算，不重复委派相同任务。"
         ),
     )
 
@@ -376,7 +583,19 @@ def main() -> None:
 
     # 索引构建一次；各用例只传新消息，没有 checkpoint 会话延续。
     # 批量运行产生多次 Chat / 查询 Embedding 请求，耗时不含启动索引成本。
-    run_evaluation(supervisor)
+    started_at = datetime.now().astimezone()
+    batch_started = perf_counter()
+
+    reports = run_evaluation(supervisor)
+
+    batch_elapsed_s = perf_counter() - batch_started
+
+    save_evaluation_report(
+        reports,
+        model_name=llm.model_name,
+        started_at=started_at,
+        batch_elapsed_s=batch_elapsed_s,
+    )
 
 if __name__ == "__main__":
     main()

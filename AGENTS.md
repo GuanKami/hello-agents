@@ -81,7 +81,8 @@ DeerFlow 是本仓库的长期学习目标，不是当前仓库的运行时依�
 ├── langgraph_subgraph_demo.py                         # 父图直接注册 RAG 子图，共享 question / answer
 ├── langgraph_parallel_demo.py                         # 固定并行、等待汇合与 operator.add reducer（已手动验证）
 ├── langgraph_map_reduce_demo.py                       # Send 动态分发、列表 reducer 与按主题汇总（已手动验证）
-├── langgraph_supervisor_demo.py                       # 专家作为工具；三用例批量流程/文本检查 3/3
+├── langgraph_supervisor_demo.py                       # 专家作为工具；六用例配置及 JSON 报告，除零异常链待验收
+├── evaluation_reports/                               # 本地评估 JSON，含成功/失败记录；当前未忽略
 ├── rag_docs/                                            # RAG 实验用的本地 Markdown 知识库
 │   ├── react.md
 │   └── stategraph.md
@@ -1028,20 +1029,22 @@ assess 异常要分开记录：已有库外问题第二轮解析失败，在 MAX
 - 知识专家只接收 question；数学专家只接收本次任务消息。父会话与子图完整 State 不自动互传，当前没有 checkpointer 或跨调用的专家会话记忆。
 - 知识工具返回 `result["answer"]`，数学工具返回最后一条消息的 content；主 Agent 不直接持有 divide。create_agent 隐藏了各自模型节点、工具节点和 ReAct 路由。
 - **手动验收（2026-10-16，维护者提供真实运行日志）**：仅知识问题调用 ask_knowledge_agent；仅计算调用 ask_math_agent 并执行 divide；混合问题同轮生成两个专家工具调用，结果分别返回后汇总，除法结果为 224.6。混合日志观察到执行重叠，不代表所有请求都并发。
-- **批量验收（2026-10-19，维护者提供 3/3 汇总）**：main 顺序运行 EVALUATION_CASES 三条真实模型用例，共用初始化索引与 Supervisor；各例只提供新消息，无 checkpoint 延续。evaluate_case 比较专家集合、工具请求/返回 ID 集合及显式错误状态、最终 AIMessage；check_business_answer 进行最小文本断言。
-- 知识断言检查 Node、State、字段/状态更新和 D1-D3 标记；数学检查 224.6 与不含“失败”；混合只检查 Node 和 224.6。曾出现专家带引用但 Supervisor 丢引用，强化提示词后本次通过，不证明长期稳定或引用语义正确。
-- run_evaluation 返回内存报告，记录专家调用次数、最终答案及单用例耗时，不含初始化索引。真实模型运行非确定性；尚无 JSON 保存、Trace 或 Token/成本统计。
-- **评估已知缺陷**：异常报告缺少 business_check，异常打印却访问它，可能再次抛 KeyError；汇总后业务明细仅属于最后一例。StateGraph 可命中 State、更长数字可命中 224.6，未知用例空断言通过；不约束专家重复调用，不验证内部 divide，引用标记不证明来源或语义。上述问题仅记录，尚未修复或验收异常路径。
-- **限制**：D# 仅属于知识专家当次检索，返回答案未附独立来源映射；RAG 引用错配和 assess 解析异常仍保留。没有统一专家异常转换、显式超时、并发限制或总 API 调用预算。divide 零除抛 ValueError，该异常路径未验收；提示词委派规则不是程序权限控制。
-- 启动时总会加载文档并请求 Embedding 建索引，纯计算或寒暄也承担该成本；运行还会产生多次 Chat 请求。内存索引不持久化，recursion_limit=20 不是所有嵌套调用的总请求次数限制。
-- **下一步**：Evaluation / Observability 已开始，保存本地报告，完善异常报告和逐用例打印，再扩展边界用例、来源与失败处理。
+- **当前评估状态**：2026-10-21：已接入六条用例、逐条流程/文本检查与 JSON 保存。三条正常任务在 2026-10-20 报告中 3/3；寒暄和库外问题在 2026-10-21 单独复跑 2/2。除零单例文本检查 1/1，但未证明实际执行 divide；未提供同批六条全部通过的证据。
+- evaluate_case 检查父层专家集合、工具请求/返回 ID 集合及 status、最终 AIMessage；不限制重复调用，也不验证内部 divide。寒暄无工具时空集合闭环通过。
+- check_business_answer 为文本冒烟检查：知识和混合用例提取 [D数字]；库外问题检查证据不足短语，除零检查失败原因。标记不证明来源合法，短语不证明业务或异常链正确；未知用例明确抛 ValueError。
+- run_evaluation 逐例打印业务明细，invoke 异常只记录类型并继续；异常分支不再访问 business_check。消息处理/业务断言/文件写入异常不在该 try 范围内。
+- save_evaluation_report 写 evaluation_reports/supervisor_<时间戳>.json，schema_version=1，含运行时间（本机时区偏移）、配置模型名、汇总、逐例断言、调用次数、答案和耗时。x 模式避免覆盖；批量计时不含初始化索引和保存文件。报告不含完整 Trace、内部工具结果、问题和来源映射；当前目录未被 Git 忽略，不将其描述为已配置排除。
+- **报告证据**：supervisor_20261020_162951_024081.json 为 3/3；supervisor_20261020_164005_518437.json 为 1/5，含限流；supervisor_20261021_094922_659625.json 为 1/2，含 assess 解析异常；supervisor_20261021_095054_656038.json 为 2/2，库外问题经过两次不足评估后退出。成功复跑不证明限流或解析异常已修复。
+- **除零边界**：supervisor_20261021_101842_807726.json 为单例文本 PASS；用户日志未出现 divide 执行及异常捕获。handle_math_tool_error 已定义但没有注册到 math_agent.middleware，故尚不生效。当前 divide 抛 ValueError，wrapper 返回 error ToolMessage 的路径尚未验收；内部工具状态仅打印。
+- **其他限制**：D# 是单次检索临时编号；提示词不是权限边界。没有统一专家异常恢复、显式超时、并发或总 API 预算。启动总会请求 Embedding 建内存索引，寒暄也有初始化成本；recursion_limit=20 不是所有嵌套请求总次数限制。
+- **下一步**：由维护者接入数学异常 wrapper，验收真实工具失败并纳入报告；补充来源映射、失败摘要、Trace 与 Token/成本。
 
 ## 5. 学习进度和路线（Learning Roadmap）
 
 ### 5.1 已完成
 
 - **Supervisor / Multi-Agent 基础（2026-10-16）**：三条真实模型手动用例已验证仅知识、仅数学、混合任务的专家选择、结果返回与汇总；详见 4.26。异常恢复和引用来源传递未完成。
-- **基础批量评估（2026-10-19）**：原脚本已加入流程检查、最小业务文本断言与耗时，维护者提供 3/3 汇总；报告落盘、语义评估、Trace/成本和异常覆盖尚未完成。
+- **基础批量评估与报告（2026-10-21）**：流程、文本/引用标记检查、逐例打印和 JSON 保存已验证；正常三例 3/3、两条边界单独复跑 2/2。异常批次成功留档。除零仅错误说明通过，真实工具异常链未验收，详见 4.26。
 
 - **Send / Map-Reduce（2026-10-16）**：`langgraph_map_reduce_demo.py` 的三主题正常路径已由维护者手动验证动态分发、结果合并和按输入顺序展示；异常及更多任务规模未验证。
 
@@ -1107,7 +1110,7 @@ RAG 基础实验（固定两步图、BM25、Dense + BM25 + RRF 集成）
 
 ### 5.2 当前阶段与执行顺序
 
-2026-10-19 进度更新：Supervisor 三条基础路径手动验证后，已在原脚本接入批量流程检查、业务文本断言和耗时，维护者提供 3/3 汇总。Evaluation / Observability 已开始，下一步保存报告并完善异常报告和逐用例明细；Trace、Token/成本与引用语义评估尚未实现。并行子图为可选补充，异常和引用质量任务继续保留。
+2026-10-21：已接入六条用例、逐条流程/文本检查与 JSON 保存。三条正常任务在 2026-10-20 报告中 3/3；寒暄和库外问题在 2026-10-21 单独复跑 2/2。除零单例文本检查 1/1，但未证明实际执行 divide；未提供同批六条全部通过的证据。 下一步接入并验证数学工具异常中间件，将内部执行证据加入报告；Trace、Token/成本和引用语义未实现。实际按正常三例、边界两例、除零单例分批推进，不记为同批六例全通过。
 
 **计划顺序**（5.3 节）与实际执行顺序：
 
@@ -1524,7 +1527,7 @@ Map-Reduce 独立入口（默认三个去重主题，三次 Chat 调用，不调
 .\.venv\Scripts\python.exe langgraph_map_reduce_demo.py
 ```
 
-Supervisor 独立入口（默认三条批量验收；启动访问 Embedding，运行产生多次 Chat 及检索请求）：
+Supervisor 独立入口（当前六条用例批量验收；启动访问 Embedding，运行产生多次 Chat 及检索请求）：
 
 ```powershell
 .\.venv\Scripts\python.exe langgraph_supervisor_demo.py
@@ -1555,7 +1558,7 @@ Supervisor 独立入口（默认三条批量验收；启动访问 Embedding，�
 
 ### 12.1 当前学习任务（最高优先级）
 
-- **当前主线：Evaluation / Observability（基础批量验收已接入）**。2026-10-19 维护者提供三用例流程与最小业务检查 3/3；下一步保存 JSON 报告并完善异常报告、逐用例打印。引用语义、内部工具成功、Trace/成本未自动验证，详见 4.26。
+- **当前主线：Evaluation / Observability（JSON 报告与边界用例已接入）**。正常三例 3/3、寒暄/库外复跑 2/2；除零只通过文本检查。优先注册 handle_math_tool_error 并验证实际 divide 失败，将内部工具证据和错误摘要纳入报告；Trace/成本及引用语义待补，详见 4.26。
 
 - **`before_model` / `after_model` 实验已完成**（`langgraph_middleware_hooks_demo.py`）：hook 已真正写入 State，两个学习目标均已由**真实模型运行**实测通过（触发次数 = 模型调用次数；返回的 dict 合并进 State 且 invoke 返回后可读）。文件头已按 6.4.3 补齐十项 docstring，基类为 `AgentState` 的扩展 `CallCountState`。详见 4.8 节。
 - 该实验**刻意只用真实模型验证，不引入假模型 / Mock**（维护者明确要求）。因此每次验证都会产生真实 API 调用与费用，结果受模型当时行为影响，不是确定性的。文件内没有自检路径。
@@ -1590,7 +1593,7 @@ Supervisor 独立入口（默认三条批量验收；启动访问 Embedding，�
 
 ### 12.5 后续学习任务
 
-- **Supervisor / Multi-Agent 基础已完成（2026-10-16）**：三条正常路径已手动验证；2026-10-19 原脚本批量流程和业务文本检查本次 3/3，详见 4.26。下一步报告保存和异常报告完善；来源映射、预算与超时仍待补充。
+- **Supervisor / Multi-Agent 基础已完成（2026-10-16）**：三条正常路径已手动验证；2026-10-19 原脚本批量流程和业务文本检查本次 3/3，详见 4.26。JSON 保存和异常分支逐例打印已完成；下一步数学异常 wrapper 注册及内部工具证据验收，来源映射、预算与超时仍待补充。
 
 - **Send / Map-Reduce 基础路径已完成（2026-10-16）**：三主题正常运行已观察动态分发、乱序完成、收集 3 项和按输入顺序输出。Supervisor / Multi-Agent 三条基础路径已手动验证，下一主线 Evaluation / Observability；并行子图为可选补充，空输入、不同规模、限流和失败恢复尚未验收。
 

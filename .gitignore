@@ -53,3 +53,4 @@ Thumbs.db
 # dive-into-langgraph/ 是独立的 git 仓库（课程源码），
 # 对于根仓库而言它是一个嵌套仓库：不跟踪其内容，避免误提交课程改动。
 dive-into-langgraph/
+evaluation_reports/
