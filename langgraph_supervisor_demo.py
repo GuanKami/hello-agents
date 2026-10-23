@@ -29,18 +29,22 @@ Supervisor 整理最终回答
 
 实现方式：
     build_supervisor 闭包保存 RAG 图和计算 Agent，两个 @tool 暴露专家入口。
-    父 Agent 仅收到专家答案；create_agent 内部组织模型、工具和返回模型的循环。
+    知识专家返回答案文本；数学专家通过 content_and_artifact 返回答案和执行记录。
+    create_agent 内部组织模型、工具和返回模型的循环。
     evaluate_case 检查专家集合、工具返回 ID、最终回答与文本断言；
     run_evaluation 逐条打印检查并返回报告；save_evaluation_report 保存 JSON。
-    handle_math_tool_error 已定义，但当前未注册到数学专家，尚不生效。
+    数学专家已注册 handle_math_tool_error，错误消息的 artifact 保存错误码。
+    ask_math_agent 汇总耗时和工具事件，经外层 artifact 返回父层评估器。
 验证方式：
     2026-10-16，维护者提供三条真实运行：知识问题仅调用知识专家；除法仅调用
     数学专家并执行 divide；混合问题调用两个专家后汇总，观察到专家执行重叠。
     2026-10-19，维护者提供批量汇总 3/3，当前流程检查与最小业务断言通过。
     2026-10-20，三用例 JSON 报告 3/3，知识和混合答案均保留 [D2]。
     2026-10-21，寒暄与库外问题 2/2，库外问题两次评估不足后正常退出。
-    除零报告 1/1 仅证明专家选择与错误说明；日志未证明 divide 执行。
-    main 当前配置六条用例，未提供同批六条全部通过的证据。
+    2026-10-23，supervisor_20261023_103103_117778.json 除零单例 1/1：
+    divide 实际收到 a=10、b=0，中间件记录 ValueError / DIVISION_BY_ZERO，
+    三项内部执行检查通过；专家耗时 5.17 秒、整例 8.39 秒。
+    评估器支持六类用例，main 当前仅启用除零单例；尚无同批六例全通过的证据。
     历史报告保留限流及评估解析异常；成功复跑不证明异常已修复。
     曾出现 Supervisor 汇总丢失引用；强化保留引用的提示词后，本次复跑通过。
 学习总结：
@@ -53,15 +57,18 @@ Supervisor 整理最终回答
     recursion_limit 限制父图运行步数，不是所有嵌套调用的 API 总次数预算。
     RAG 引用错配和 assess 解析异常仍可能发生；divide 零除会抛 ValueError。
     启动总会建立内存向量索引，纯计算或寒暄也有 Embedding 初始化请求。
-    评估仅看父层消息，不验证内部 divide；集合比较不限制专家重复调用。
+    数学专家正常返回后收集工具事件，目前仅除零用例应用内部执行断言。
+    专家 invoke 抛出未处理异常时没有完整 trace；集合比较不限制重复调用。
     文本断言较粗：State 可命中 StateGraph，224.6 可命中更长数字；
-    知识和混合用例正则提取 [D数字]，不验证来源或语义；库外/除零检查仅看短语。
+    知识和混合用例正则提取 [D数字]，不验证来源或语义；库外/除零的业务
+    文本检查依赖短语，除零另有独立的内部执行检查。
     invoke 异常已记录且跳过正常打印；未知用例会抛 ValueError，不再空检查通过。
     消息处理、业务检查与写文件错误不在 invoke 的 try 范围内，仍可能中断整批。
-    内部工具消息仅打印，不进入报告；数学异常 wrapper 未注册，异常链未验收。
+    报告含数学专家局部 trace，不含完整内部消息、知识专家过程或 Token/成本。
+    父层专家工具正常返回与内部 divide 业务失败可以同时成立。
 后续优化方向：
-    注册并验收数学异常 wrapper，将内部工具证据纳入报告，再补充来源、预算、
-    Trace 与 Token/成本；保留成功及失败报告作为回归记录。
+    补充知识专家的检索次数、证据评估和退出原因，再补来源映射、未处理异常、
+    预算与 Token/成本；保留成功及失败报告作为回归记录。
 """
 import os
 import re
@@ -92,38 +99,10 @@ from langgraph_hybrid_rag_demo import (
 
 from tools import divide
 
-# 六条用例包括正常任务、寒暄、库外问题和除零错误说明。
-# 除零 PASS 不能证明内部 divide 或异常 wrapper 执行。
+# 评估规则覆盖正常任务、寒暄、库外问题和除零；当前仅启用除零单例。
+# 除零同时检查业务文本和内部执行记录；其余用例暂不应用内部工具断言。
 # 专家集合只检查选择范围，不约束调用顺序或重复调用次数。
 EVALUATION_CASES = [
-    {
-        "name": "只问知识",
-        "question": "请解释 StateGraph 中 Node 的职责。",
-        "expected_tools": {"ask_knowledge_agent"},
-    },
-    {
-        "name": "只做计算",
-        "question": "请计算 2246 除以 10。",
-        "expected_tools": {"ask_math_agent"},
-    },
-    {
-        "name": "知识与计算",
-        "question": "请解释 StateGraph 中 Node 的职责，并计算 2246 除以 10。",
-        "expected_tools": {
-            "ask_knowledge_agent",
-            "ask_math_agent",
-        },
-    },
-    {
-        "name": "寒暄",
-        "question": "你好。",
-        "expected_tools": set(),
-    },
-    {
-        "name": "知识库无答案",
-        "question": "DeerFlow 使用什么数据库保存长期记忆？",
-        "expected_tools": {"ask_knowledge_agent"},
-    },
     {
         "name": "除零异常",
         "question": "请计算 10 除以 0。",
@@ -170,10 +149,56 @@ def evaluate_case(supervisor, case: dict) -> dict:
         if isinstance(message, ToolMessage)
     ]
 
+    # 显式提取程序生成的 artifact，避免从最终回答推测内部执行。
+    expert_traces = [
+        {
+            **message.artifact,
+            "parent_tool_call_id": message.tool_call_id,
+        }
+        for message in tool_messages
+        if message.name == "ask_math_agent"
+        and isinstance(message.artifact, dict)
+        and message.artifact.get("expert") == "math_agent"
+    ]
+
+    # 当前仅除零用例应用内部执行断言，其他用例不据此宣称内部流程已验收。
+    execution_checks = {}
+
+    if case["name"] == "除零异常":
+        divide_events = [
+            event
+            for trace in expert_traces
+            for event in trace["tool_events"]
+            if event["name"] == "divide"
+        ]
+
+        execution_checks = {
+            "存在数学专家执行记录": bool(expert_traces),
+            "实际调用 divide 且参数为 10 和 0": any(
+                event["args"].get("a") == 10
+                and event["args"].get("b") == 0
+                for event in divide_events
+            ),
+            "除零错误被中间件识别": any(
+                event["args"].get("a") == 10
+                and event["args"].get("b") == 0
+                and event["status"] == "error"
+                and event["error_code"] == "DIVISION_BY_ZERO"
+                for event in divide_events
+            ),
+        }
+
+    execution_check = {
+        "applicable": case["name"] == "除零异常",
+        "passed": all(execution_checks.values()),
+        "checks": execution_checks,
+    }
+
     actual_tools = {call["name"] for call in calls}
 
     # 按 ID 集合检查请求/返回闭环及显式 error 状态，不证明业务答案正确，
-    # 也看不到专家内部工具消息或重复 ID 的数量差异。
+    # 该父层检查不覆盖内部 divide；后者由 execution_check 单独验证。
+    # 集合比较仍不能发现重复 ID 的数量差异。
     call_ids = {call["id"] for call in calls}
     returned_ids = {
         message.tool_call_id
@@ -208,7 +233,13 @@ def evaluate_case(supervisor, case: dict) -> dict:
     return {
         "name": case["name"],
         "business_check": business_check,
-        "passed": routing_ok and tool_results_ok and final_answer_ok and business_check["passed"],
+        "passed": (
+            routing_ok
+            and tool_results_ok
+            and final_answer_ok
+            and business_check["passed"]
+            and execution_check["passed"]
+            ),
         "routing_ok": routing_ok,
         "tool_results_ok": tool_results_ok,
         "final_answer_ok": final_answer_ok,
@@ -218,6 +249,8 @@ def evaluate_case(supervisor, case: dict) -> dict:
         "elapsed_s": round(perf_counter() - started, 2),
         "answer": last_message.content if final_answer_ok else "",
         "error_type": None,
+        "expert_traces": expert_traces,
+        "execution_check": execution_check,
     }
 
 def run_evaluation(supervisor) -> list[dict]:
@@ -249,6 +282,13 @@ def run_evaluation(supervisor) -> list[dict]:
         print("业务结果检查：", report["business_check"]["checks"])
         print("业务结果通过：", report["business_check"]["passed"])
         print("提取到的引用：", report["business_check"]["citation_ids"])
+
+        if report["execution_check"]["applicable"]:
+            print("内部执行检查：", report["execution_check"]["checks"])
+            print("内部执行通过：", report["execution_check"]["passed"])
+
+        for trace in report["expert_traces"]:
+            print("专家执行记录：", trace)
 
         print("耗时：", report["elapsed_s"], "秒")
         print("结果：", "PASS" if report["passed"] else "FAIL")
@@ -399,7 +439,8 @@ def save_evaluation_report(
         "cases": reports,
     }
 
-    # 报告不含问题、内部工具消息、来源映射及 Token/Trace；异常报告结构较精简。
+    # 报告含数学专家局部 trace，不含完整内部消息、问题、来源映射或 Token/成本。
+    # invoke 异常仅记录类型和耗时，尚无异常前的完整执行记录。
     # x 模式避免意外覆盖已经存在的报告。
     with report_path.open("x", encoding="utf-8") as file:
         json.dump(payload, file, ensure_ascii=False, indent=2)
@@ -415,10 +456,12 @@ def handle_math_tool_error(
     request: ToolCallRequest,
     handler: Callable[[ToolCallRequest], ToolMessage | Command],
 ) -> ToolMessage | Command:
-    """拟转换 divide 的已知除零 ValueError；当前未注册，尚不生效。
+    """将 divide 的已知除零 ValueError 转换为可返回模型的错误消息。
 
     与旧实验的 ZeroDivisionError 不同，当前 tools.py 主动抛 ValueError。
-    只有注册到数学专家的 middleware 后，才能进入真实工具执行链。
+    已在数学专家 middleware 注册；只处理工具名和错误文本均匹配的异常。
+    content 供模型说明失败原因，artifact 供程序读取错误码；其他异常原样抛出。
+    返回错误消息表示流程可继续，不代表计算成功。
     """
     tool_call = request.tool_call
 
@@ -450,22 +493,95 @@ def handle_math_tool_error(
             name=tool_call["name"],
             tool_call_id=tool_call["id"],
             status="error",
+            artifact={
+                "error_code": "DIVISION_BY_ZERO",
+                "error_type": type(exc).__name__,
+            },
         )
 
 def build_supervisor(llm, rag_graph):
     # 构建时不执行任务；数学专家有自己的消息输入和工具循环。
     # 主 Agent 不直接持有 divide，只能通过专家工具委派。
-    # 当前缺少 middleware=[handle_math_tool_error]，定义 wrapper 不会自动注册。
+    # 显式注册 wrapper，已知除零异常才能转换为带错误码 artifact 的消息。
     math_agent = create_agent(
         model=llm,
         tools=[divide],
+        middleware=[handle_math_tool_error],
         name="math_agent",
         system_prompt=(
             "你是计算专家，使用中文回答。"
-            "遇到除法问题必须调用 divide 工具，以工具结果为准。"
+            "每个除法问题都必须调用 divide 工具，以工具结果为准。"
+            "即使除数为 0，也必须调用 divide，让工具报告错误。"
+            "工具返回错误后，如实说明失败原因，"
+            "不要重试相同参数，不要修改用户数字，不要编造计算结果。"
             "不要处理知识库问题。"
         ),
     )
+
+    # 内部错误消息的 artifact 保存错误码；专家工具的 artifact 返回局部 trace。
+    # content 进入父模型上下文，artifact 由程序读取；完整 State 不自动返回。
+    @tool(response_format="content_and_artifact")
+    def ask_math_agent(question: str) -> tuple[str, dict]:
+        """委派除法计算任务；请传入完整的计算问题。"""
+        print(f"[math_agent] 开始：{question}")
+        started = perf_counter()
+
+        result = math_agent.invoke({
+            "messages": [
+                {"role": "user", "content": question},
+            ],
+        })
+
+        # 根据内部 tool_call_id，关联工具请求参数与实际返回结果。
+        internal_calls = {
+            call["id"]: call
+            for message in result["messages"]
+            if isinstance(message, AIMessage)
+            for call in message.tool_calls
+        }
+
+        tool_events = []
+
+        for message in result["messages"]:
+            if not isinstance(message, ToolMessage):
+                continue
+
+            call = internal_calls.get(message.tool_call_id, {})
+            print("[math_agent tool artifact]", message.artifact)
+            details = (
+                message.artifact
+                if isinstance(message.artifact, dict)
+                else {}
+            )
+
+            tool_events.append({
+                "name": message.name or call.get("name"),
+                "tool_call_id": message.tool_call_id,
+                "args": call.get("args", {}),
+                "status": message.status,
+                "error_code": details.get("error_code"),
+                "error_type": details.get("error_type"),
+            })
+
+        handled_business_error = any(
+            event["name"] == "divide"
+            and event["status"] == "error"
+            and event["error_code"] == "DIVISION_BY_ZERO"
+            for event in tool_events
+        )
+
+        # 仅在专家正常返回后构建；耗时不含 Supervisor 的前后模型调用。
+        trace = {
+            "expert": "math_agent",
+            "elapsed_s": round(perf_counter() - started, 2),
+            "tool_events": tool_events,
+            "handled_business_error": handled_business_error,
+        }
+
+        print("[math_agent trace]", trace)
+        print("[math_agent] 完成")
+
+        return result["messages"][-1].content, trace
 
     @tool
     def ask_knowledge_agent(question: str) -> str:
@@ -485,33 +601,6 @@ def build_supervisor(llm, rag_graph):
         # 父工具执行层会将返回值包装为 ToolMessage；不传回完整子图 State。
         # documents、检索轮数和 D# 来源映射未随答案返回。
         return result["answer"]
-
-    @tool
-    def ask_math_agent(question: str) -> str:
-        """委派除法计算任务；请传入完整的计算问题。"""
-        print(f"[math_agent] 开始：{question}")
-
-        # 本次仅提供新的任务消息，没有通过 checkpointer 延续专家会话。
-        result = math_agent.invoke({
-            "messages": [
-                {"role": "user", "content": question},
-            ],
-        })
-
-        # 内部工具状态仅打印，父层验收报告看不到这些消息。
-        for message in result["messages"]:
-            if isinstance(message, ToolMessage):
-                print(
-                    f"[math_agent tool] name={message.name}, "
-                    f"status={message.status}, "
-                    f"tool_call_id={message.tool_call_id}"
-                )
-                print("[math_agent tool] content =", message.content)
-
-        print("[math_agent] 完成")
-
-        # 取专家的最后一条回答，不返回其完整内部工具循环。
-        return result["messages"][-1].content
 
     # 工具名、schema 和 docstring 帮助模型选专家；同轮两个工具可重叠执行，
     # 但不能保证每次都调用两个专家或每次都并发。
