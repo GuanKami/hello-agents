@@ -29,7 +29,8 @@ Supervisor 整理最终回答
 
 实现方式：
     build_supervisor 闭包保存 RAG 图和计算 Agent，两个 @tool 暴露专家入口。
-    知识专家返回答案文本；数学专家通过 content_and_artifact 返回答案和执行记录。
+    两类专家均通过 content_and_artifact 返回答案与程序执行摘要。
+    知识专家从 RAG State 提取检索次数、各轮证据评估及实际退出节点。
     create_agent 内部组织模型、工具和返回模型的循环。
     evaluate_case 检查专家集合、工具返回 ID、最终回答与文本断言；
     run_evaluation 逐条打印检查并返回报告；save_evaluation_report 保存 JSON。
@@ -44,7 +45,10 @@ Supervisor 整理最终回答
     2026-10-23，supervisor_20261023_103103_117778.json 除零单例 1/1：
     divide 实际收到 a=10、b=0，中间件记录 ValueError / DIVISION_BY_ZERO，
     三项内部执行检查通过；专家耗时 5.17 秒、整例 8.39 秒。
-    评估器支持六类用例，main 当前仅启用除零单例；尚无同批六例全通过的证据。
+    2026-10-28，supervisor_20261028_104622_109646.json 知识两例 2/2：
+    有答案检索一次后生成；库外问题第二轮解析失败，在上限处保守回退退出。
+    当前启用知识两例；新增检索上限断言已写入代码，尚无含此断言的新报告。
+    历史各批分别通过，不代表当前版本同批六例回归通过。
     历史报告保留限流及评估解析异常；成功复跑不证明异常已修复。
     曾出现 Supervisor 汇总丢失引用；强化保留引用的提示词后，本次复跑通过。
 学习总结：
@@ -57,18 +61,20 @@ Supervisor 整理最终回答
     recursion_limit 限制父图运行步数，不是所有嵌套调用的 API 总次数预算。
     RAG 引用错配和 assess 解析异常仍可能发生；divide 零除会抛 ValueError。
     启动总会建立内存向量索引，纯计算或寒暄也有 Embedding 初始化请求。
-    数学专家正常返回后收集工具事件，目前仅除零用例应用内部执行断言。
+    数学专家记录工具事件；知识两例检查检索、评估记录及实际退出节点。
     专家 invoke 抛出未处理异常时没有完整 trace；集合比较不限制重复调用。
     文本断言较粗：State 可命中 StateGraph，224.6 可命中更长数字；
     知识和混合用例正则提取 [D数字]，不验证来源或语义；库外/除零的业务
-    文本检查依赖短语，除零另有独立的内部执行检查。
+    文本检查依赖短语，除零与知识两例另有独立的内部执行检查。
     invoke 异常已记录且跳过正常打印；未知用例会抛 ValueError，不再空检查通过。
     消息处理、业务检查与写文件错误不在 invoke 的 try 范围内，仍可能中断整批。
-    报告含数学专家局部 trace，不含完整内部消息、知识专家过程或 Token/成本。
+    报告含数学与知识专家局部 trace，不含完整内部消息、来源映射或 Token/成本。
+    当前知识检查的 if/else 位于知识分支外，其他用例可能访问未定义的 events；
+    两条知识用例通过不能证明其他用例在当前版本仍可执行。
     父层专家工具正常返回与内部 divide 业务失败可以同时成立。
 后续优化方向：
-    补充知识专家的检索次数、证据评估和退出原因，再补来源映射、未处理异常、
-    预算与 Token/成本；保留成功及失败报告作为回归记录。
+    先修正知识验收分支的缩进并回归其他用例，再学习 Token 用量统计；
+    来源映射、未处理异常与预算后续补充，保留成功及失败报告。
 """
 import os
 import re
@@ -91,6 +97,7 @@ from langchain.messages import AIMessage, ToolMessage
 from langgraph_agentic_rag_demo import (
     build_graph as build_rag_graph,
     load_documents,
+    MAX_RETRIEVALS,
 )
 from langgraph_hybrid_rag_demo import (
     build_bm25,
@@ -99,14 +106,19 @@ from langgraph_hybrid_rag_demo import (
 
 from tools import divide
 
-# 评估规则覆盖正常任务、寒暄、库外问题和除零；当前仅启用除零单例。
-# 除零同时检查业务文本和内部执行记录；其余用例暂不应用内部工具断言。
+# 评估规则覆盖六类任务；当前仅启用知识有答案和知识库无答案两例。
+# 除零与知识两例有内部执行检查；检索上限断言是报告生成后补入的。
 # 专家集合只检查选择范围，不约束调用顺序或重复调用次数。
 EVALUATION_CASES = [
     {
-        "name": "除零异常",
-        "question": "请计算 10 除以 0。",
-        "expected_tools": {"ask_math_agent"},
+        "name": "只问知识",
+        "question": "请解释 StateGraph 中 Node 的职责。",
+        "expected_tools": {"ask_knowledge_agent"},
+    },
+    {
+        "name": "知识库无答案",
+        "question": "DeerFlow 使用什么数据库保存长期记忆？",
+        "expected_tools": {"ask_knowledge_agent"},
     },
 ]
 
@@ -149,27 +161,33 @@ def evaluate_case(supervisor, case: dict) -> dict:
         if isinstance(message, ToolMessage)
     ]
 
-    # 显式提取程序生成的 artifact，避免从最终回答推测内部执行。
+    expert_names = {
+        "ask_knowledge_agent": "knowledge_agent",
+        "ask_math_agent": "math_agent",
+    }
+
+    # 显式提取程序生成的 artifact，避免从最终回答推测内部执行。s
     expert_traces = [
         {
             **message.artifact,
             "parent_tool_call_id": message.tool_call_id,
         }
         for message in tool_messages
-        if message.name == "ask_math_agent"
+        if message.name in expert_names
         and isinstance(message.artifact, dict)
-        and message.artifact.get("expert") == "math_agent"
+        and message.artifact.get("expert") == expert_names[message.name]
     ]
 
-    # 当前仅除零用例应用内部执行断言，其他用例不据此宣称内部流程已验收。
+    # 除零检查工具事件；知识两例检查 RAG State 摘要，不从最终措辞推断流程。
     execution_checks = {}
 
     if case["name"] == "除零异常":
         divide_events = [
             event
             for trace in expert_traces
-            for event in trace["tool_events"]
-            if event["name"] == "divide"
+            if trace.get("expert") == "math_agent"
+            for event in trace.get("tool_events", [])
+            if event.get("name") == "divide"
         ]
 
         execution_checks = {
@@ -188,8 +206,65 @@ def evaluate_case(supervisor, case: dict) -> dict:
             ),
         }
 
+    elif case["name"] in {"只问知识", "知识库无答案"}:
+        knowledge_traces = [
+            trace
+            for trace in expert_traces
+            if trace.get("expert") == "knowledge_agent"
+        ]
+
+        # 这两条验收用例预期只调用一次知识专家。
+        trace = (
+            knowledge_traces[0]
+            if len(knowledge_traces) == 1
+            else {}
+        )
+
+        retrieval_count = trace.get("retrieval_count", 0)
+        events = trace.get("assessment_events", [])
+
+        execution_checks = {
+            "恰有一条知识专家执行记录": len(knowledge_traces) == 1,
+            "实际执行过检索": retrieval_count >= 1,
+            "检索次数未超过上限": (
+                1 <= retrieval_count <= MAX_RETRIEVALS
+            ),
+            "每轮检索都有评估记录": (
+                len(events) == retrieval_count
+            ),
+        }
+
+    if case["name"] == "只问知识":
+        execution_checks.update({
+            "最后一轮证据充分": (
+                bool(events)
+                and events[-1].get("sufficient") is True
+            ),
+            "经过有证据生成节点": (
+                trace.get("exit_reason") == "grounded_generate"
+            ),
+        })
+
+    else:
+        execution_checks.update({
+            "没有判定证据充分": (
+                bool(events)
+                and all(
+                    event.get("sufficient") is False
+                    for event in events
+                )
+            ),
+            "经过无证据退出节点": (
+                trace.get("exit_reason") == "no_evidence"
+            ),
+        })
+
     execution_check = {
-        "applicable": case["name"] == "除零异常",
+        "applicable": case["name"] in {
+            "除零异常",
+            "只问知识",
+            "知识库无答案",
+        },
         "passed": all(execution_checks.values()),
         "checks": execution_checks,
     }
@@ -439,7 +514,7 @@ def save_evaluation_report(
         "cases": reports,
     }
 
-    # 报告含数学专家局部 trace，不含完整内部消息、问题、来源映射或 Token/成本。
+    # 报告含两类专家局部 trace，不含完整内部消息、问题、来源映射或 Token/成本。
     # invoke 异常仅记录类型和耗时，尚无异常前的完整执行记录。
     # x 模式避免意外覆盖已经存在的报告。
     with report_path.open("x", encoding="utf-8") as file:
@@ -583,24 +658,37 @@ def build_supervisor(llm, rag_graph):
 
         return result["messages"][-1].content, trace
 
-    @tool
-    def ask_knowledge_agent(question: str) -> str:
+    @tool(response_format="content_and_artifact")
+    def ask_knowledge_agent(question: str) -> tuple[str, dict]:
         """
         查询本地知识库中的 LangGraph、StateGraph、ReAct 知识；
         DeerFlow 实现问题也交由此入口核查，资料不足时返回无法回答。
         """
         print(f"[knowledge_agent] 开始：{question}")
+        started = perf_counter()
 
         # 只传入子任务，父 Agent 的完整会话不会自动进入子图上下文。
+        # 每次专家调用显式初始化本次任务的过程字段。
         result = rag_graph.invoke({
             "question": question,
+            "retrieval_count": 0,
+            "assessment_events": [],
         })
 
+        trace = {
+            "expert": "knowledge_agent",
+            "elapsed_s": round(perf_counter() - started, 2),
+            "retrieval_count": result.get("retrieval_count", 0),
+            "assessment_events": result.get("assessment_events", []),
+            "exit_reason": result.get("exit_reason"),
+        }
+
+        print("[knowledge_agent trace]", trace)
         print("[knowledge_agent] 完成")
 
         # 父工具执行层会将返回值包装为 ToolMessage；不传回完整子图 State。
-        # documents、检索轮数和 D# 来源映射未随答案返回。
-        return result["answer"]
+        # trace 返回检索轮数、评估事件与退出原因；documents 和 D# 映射仍未返回。
+        return result["answer"], trace
 
     # 工具名、schema 和 docstring 帮助模型选专家；同轮两个工具可重叠执行，
     # 但不能保证每次都调用两个专家或每次都并发。

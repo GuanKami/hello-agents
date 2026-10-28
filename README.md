@@ -6,7 +6,7 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 10 月 23 日，LangGraph、Memory、Context、Middleware、HITL、MCP、Hybrid/Agentic RAG、Subgraph、并行与 Supervisor 基础已有实验结果。Evaluation / Observability 已接入流程/文本检查、JSON 报告和数学专家局部 trace；正常三例 3/3、边界两例 2/2、除零单例 1/1 分批通过。除零已验证实际工具执行及错误码，知识专家过程、完整 Trace/成本与引用语义仍待完善。
+> 截至 2026 年 10 月 28 日，已进入 Evaluation / Observability。JSON 报告、数学除零链与知识专家局部 trace 已分批验证，最新知识两例 2/2。新增检索上限断言待复跑；完整 Trace、引用语义、Token/成本仍待完善。
 >
 > 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 Hybrid RAG 输出读取 2 份 Markdown 并切分为 9 个文本块。针对 ToolMessage 问题，RRF Top-3 为 `react.md/start=363`（Dense/BM25 均第 1，0.0328）、`react.md/start=0`（均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）；图实际发送给 LLM 的上下文顺序与融合排名一致，答案使用了对应的 `[D1]`、`[D2]`、`[D3]`。这是一条小型语料上的正向端到端验证，不代表系统化检索质量、引用语义或库外拒答评估。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
@@ -258,7 +258,7 @@ Embedding。Supervisor / Multi-Agent 基础已验证，下一主线是 Evaluatio
      <- Supervisor 最终回答
 ```
 
-专家仅接收本次子任务，父会话不会自动传入专家。知识专家返回答案文本；数学专家通过
+专家仅接收本次子任务，父会话不会自动传入专家。知识和数学专家均通过
 `content_and_artifact` 返回答案和程序生成的局部 trace：content 进入父模型上下文，
 artifact 由评估器读取。完整 State 和内部消息不会自动返回。多个角色共用模型客户端，分别配置提示词与工具。
 create_agent 在内部组织模型调用、工具执行和回到模型的循环。
@@ -277,7 +277,7 @@ create_agent 在内部组织模型调用、工具执行和回到模型的循环�
 recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，当前已由注册的中间件
 转换为错误 ToolMessage，并通过内部执行验收；其他专家异常尚未统一处理。
 
-评估器支持知识、计算、混合、寒暄、库外和除零六类用例；当前 EVALUATION_CASES 仅启用除零单例。main 按该列表运行，共用初始化索引和 Supervisor。
+评估器支持知识、计算、混合、寒暄、库外和除零六类用例；当前 EVALUATION_CASES 启用知识两例。main 按该列表运行，共用初始化索引和 Supervisor。
 各用例只传入新消息，没有 checkpoint 会话延续。启动均会建立内存向量索引，
 因此纯计算或寒暄也有 Embedding 初始化请求，运行还会产生多次 Chat 请求。
 
@@ -287,9 +287,9 @@ recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，�
 
 ### 本地评估与报告
 
-2026-10-23：评估器支持六类用例；当前 EVALUATION_CASES 仅启用除零单例，流程/文本检查、JSON 报告和数学专家局部 trace 已接入。正常三例于 2026-10-20 通过 3/3；寒暄和库外问题于 2026-10-21 单独通过 2/2；除零于 2026-10-23 单例通过 1/1，实际 divide 参数、错误码和内部执行检查均通过。以上为分批结果，尚无同批六条全部通过的证据。
+2026-10-28：数学与知识专家均返回局部 artifact trace。知识有答案/库外两例在 supervisor_20261028_104622_109646.json 中 2/2：分别检索 1 次后生成，以及检索 2 次、末轮解析失败后保守退出。新增检索上限断言已在代码中，但该报告未包含此断言，尚待复跑。历史正常 3/3、边界 2/2、除零 1/1 为分批结果，尚无当前版本同批六例回归证据。 当前 EVALUATION_CASES 启用知识两例；后续先修正验收分支缩进，再做 Token 用量统计。
 
-运行后保存 evaluation_reports/supervisor_<时间戳>.json，包含 schema_version、运行时间及本机时区偏移、配置模型名、汇总、逐条流程和业务检查、专家调用次数、答案、耗时，以及 expert_traces / execution_check。文件使用 UTF-8 和独立时间戳，以 x 模式避免覆盖。计时不包含启动索引和报告保存；当前有数学专家局部 trace，尚无知识专家过程、Token/成本或完整 Trace。
+运行后保存 evaluation_reports/supervisor_<时间戳>.json，包含 schema_version、运行时间及本机时区偏移、配置模型名、汇总、逐条流程和业务检查、专家调用次数、答案、耗时，以及 expert_traces / execution_check。文件使用 UTF-8 和独立时间戳，以 x 模式避免覆盖。计时不包含启动索引和报告保存；当前有两类专家局部 trace，尚无 Token/成本或完整 Trace。
 
 | 报告 | 已观察结果 |
 | --- | --- |
@@ -299,6 +299,7 @@ recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，�
 | supervisor_20261021_095054_656038.json | 寒暄/库外复跑 2/2；库外两次评估不足后退出 |
 | supervisor_20261021_101842_807726.json | 除零单例文本检查 1/1；未证明 divide 被调用 |
 | supervisor_20261023_103103_117778.json | 除零 1/1；实际参数、错误码和内部检查通过；专家 5.17 秒、整例 8.39 秒 |
+| supervisor_20261028_104622_109646.json | 知识两例 2/2；一次检索后生成、两次检索后末轮解析失败回退；新增上限断言未包含在此报告 |
 
 每条用例打印自己的业务明细；invoke 异常记录类型后继续，最后仍可保存失败批次。未知用例缺少业务规则时明确报错，不会自动通过。消息解析、业务检查和写文件错误仍可能中断整批。
 
@@ -306,15 +307,17 @@ recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，�
 
 **数学异常链已验收**：数学专家已注册 handle_math_tool_error，捕获 divide 的已知除零 ValueError。内部错误 ToolMessage 的 artifact 保存错误码和异常类型；ask_math_agent 按 tool_call_id 关联参数与返回消息，汇总耗时及工具事件，经专家工具的 artifact 返回父层。evaluate_case 提取记录，附上 parent_tool_call_id 并保存到 JSON。只有“不能除以零”的回答而没有实际调用工具，仍不能通过内部执行检查。
 
-父层 ask_math_agent 正常返回表示专家完成了失败说明，不代表内部 divide 计算成功。局部 trace 仅在专家 invoke 正常返回后构建，尚未保存未处理异常前的完整过程。下一步补充知识专家的检索次数、证据评估及退出原因，再完善来源映射、未处理异常记录、预算与 Token/成本。
+父层 ask_math_agent 正常返回表示专家完成了失败说明，不代表内部 divide 计算成功。局部 trace 仅在专家 invoke 正常返回后构建，尚未保存未处理异常前的完整过程。知识专家过程记录已接入；下一步先修正验收分支缩进并回归，再学习 Token 用量统计。来源映射、未处理异常和预算后续补充。
 
 报告包含最终回答、工具参数和执行记录等业务内容，目前 evaluation_reports/ 仍未被 Git 忽略；提交前应检查其中内容。成功复跑没有消除之前观察到的限流、解析异常和引用质量限制。
+
+知识过程验收（2026-10-28）：supervisor_20261028_104622_109646.json 保存 retrieval_count、assessment_events、exit_reason 和 parent_tool_call_id。第二例的末轮 sufficient=False 来自解析失败后的程序回退，不是正常解析结论。当前新增上限断言已静态核对，报告仍是添加前版本。当前知识检查 if/else 位于知识分支外，其他用例可能访问未定义 events；需修正后回归。首轮解析失败仍抛出，异常前的完整 trace 未收集。
 
 ### 实验目录
 
 | 文件 | 学习内容 | 当前状态 |
 | --- | --- | --- |
-| `langgraph_supervisor_demo.py` | 专家委派与批量验收 | 六类验收规则及 JSON；正常 3/3、边界 2/2、除零 1/1 分批通过，数学局部 trace 已验证 |
+| `langgraph_supervisor_demo.py` | 专家委派与批量验收 | 数学/知识局部 trace 已分批验证，知识两例 2/2；新增上限断言待复跑，其他用例有检查分支缩进限制 |
 | [`langgraph_map_reduce_demo.py`](langgraph_map_reduce_demo.py) | Send 动态分发、局部任务输入、列表 reducer 与按主题汇总 | 三主题正常路径已手动验证；更多规模和异常路径未验证 |
 | [`langgraph_parallel_demo.py`](langgraph_parallel_demo.py) | 固定分叉、等待汇合、operator.add 合并共享 results | 已由维护者手动验证；保留固定分支基线，异常路径未验证 |
 | [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步 Hybrid RAG：Dense + BM25 + RRF、State 传递和带引用生成 | 已完成一次端到端正向运行，图内 RRF 名次与模型上下文/D# 顺序一致；更广评测与库外拒答待后续补充 |
@@ -528,7 +531,7 @@ Middleware
   -> Send / Map-Reduce [三主题正常路径已手动验证，2026-10-16]
   -> 并行子图 [可选补充，尚未学习]
   -> Supervisor / Multi-Agent [三条基础路径已手动验证，2026-10-16]
-  -> Evaluation / Observability [JSON、数学局部 trace 与除零链已验证；知识专家过程、完整 Trace/成本待补]
+  -> Evaluation / Observability [JSON、数学局部 trace 与除零链已验证；知识过程已验证；完整 Trace/Token 待补]
   -> RepoResearcher MVP
   -> DeerFlow 源码对照与工程化演进
 ```

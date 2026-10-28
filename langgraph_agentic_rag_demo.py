@@ -10,7 +10,7 @@
 
 使用的 Agent 概念：
     Agentic RAG、结构化输出、StateGraph 条件路由、Hybrid Retrieval、证据评估、
-    查询改写、有界重试、Grounded Generation 和拒答。
+    查询改写、有界重试、Grounded Generation、拒答与 State 过程记录。
 
 系统架构：
     START -> decide -> (direct -> direct_answer -> END)
@@ -24,6 +24,8 @@
     检索查询，但最终 action 固定为 retrieve。retrieve 复用 Dense + BM25 + RRF；assess
     判断证据是否充分，证据不足时可改写查询并在程序限制内重试；充分时进入
     grounded_generate，否则进入 no_evidence。direct 分支独立回答，不声称查过本地资料。
+    assessment_events 由评估节点返回历史加本轮的新列表（覆盖字段，无追加 reducer）；
+    exit_reason 由三个结束节点写入，供 Supervisor 提取结构化执行摘要。
 
 验证方式：
     已通过少量真实模型手动验收：独立问候进入 direct；知识库内 StateGraph 问题及带有
@@ -33,6 +35,8 @@
     不支持 Node 返回字段更新，需人工核对。后续答案仍把来自 D2 的 Edge 原文标为 D1。
     完成的是基础验收方法，不是引用正确性保证。第二轮 assess 解析失败后保守退出
     也已观察，不能记为两轮正常评估。运行会调用外部 API，可能产生费用。
+    2026-10-28，Supervisor 知识两例报告 2/2，记录一次检索后生成及两次检索后
+    解析失败回退；末轮事件保留 OutputParserException 和回退标记。
 
 学习总结：
     固定路由策略只允许独立寒暄走 direct，其他输入一律 retrieve；规划模型提供查询改写，
@@ -47,9 +51,11 @@
     不能代替引用校验，且已观察到错配。语料仅有少量本地文档，向量索引使用
     InMemoryVectorStore，进程结束后丢失。direct 虽跳过检索节点，main() 仍会预先加载
     语料并建索引。模型调用等运行时异常仍可能使图失败。
+    首轮解析失败仍抛异常，节点未返回的事件不会写入 State；局部摘要不是完整 Trace。
+    回退事件 sufficient=False 是程序保守决定，不代表模型成功解析后判定不足。
 
 后续优化方向：
-    基础路径和引用验收方法阶段性收口，下一主线学习 Subgraph，再学习并行和 Multi-Agent。
+    已接入 Supervisor 并完成知识专家过程记录基础验收，下一步学习 Token 用量统计。
     保留引用错配失败样例，后续完善摘录归属检查、逐条支持评估及 assess 异常处理。
 """
 
@@ -110,6 +116,13 @@ class AgenticRAGState(TypedDict):
     sufficient: NotRequired[bool]
     retry_query: NotRequired[str | None]
     answer: NotRequired[str]
+    # 按执行顺序保存各轮证据评估。
+    assessment_events: NotRequired[list[dict]]
+
+    # 由最终执行的业务节点填写，不让模型自行生成。
+    exit_reason: NotRequired[
+        Literal["direct", "grounded_generate", "no_evidence"]
+    ]
 
 def is_standalone_small_talk(question: str) -> bool:
     """只识别独立的寒暄/感谢，不把带知识问题的句子误判为寒暄。"""
@@ -287,7 +300,10 @@ def build_graph(vector_store, llm, bm25, chunks):
             ]
         )
 
-        return {"answer": response.content}
+        return {
+            "answer": response.content,
+            "exit_reason": "direct",
+        }
 
     def assess_node(state: AgenticRAGState):
         """评估当前召回内容能否直接支持回答；不足时生成候选改写查询。"""
@@ -323,15 +339,40 @@ def build_graph(vector_store, llm, bm25, chunks):
 
         review = result["parsed"]
 
+        # 此时 retrieve 已完成计数；这里记录本轮评估对应的实际查询。
+        event = {
+            "round": state.get("retrieval_count", 0),
+            "query": state["search_query"],
+            "sufficient": None,
+            "retry_query": None,
+            "parse_error": (
+                type(result["parsing_error"]).__name__
+                if result["parsing_error"] is not None
+                else None
+            ),
+            "fallback": None,
+        }
+
+        # 返回完整新列表，由普通字段覆盖；不要同时给该字段添加 operator.add。
+        previous_events = state.get("assessment_events", [])
+
         if result["parsing_error"] is not None or review is None:
             if state.get("retrieval_count", 0) >= MAX_RETRIEVALS:
                 # 已没有后续检索机会；评估结果不可信时按证据不足处理，避免无依据生成。
                 print("[assess fallback] 已达到最大检索次数，保守停止并进入 no_evidence")
+                event.update({
+                    "sufficient": False,
+                    "retry_query": "",
+                    "fallback": "max_retrievals_parse_failure",
+                })
+
                 return {
                     "sufficient": False,
                     "retry_query": "",
+                    "assessment_events": previous_events + [event],
                 }
 
+            # 这里抛出异常，不会提交本轮 event；当前没有异常前的完整事件收集器。
             if result["parsing_error"] is not None:
                 raise result["parsing_error"]
 
@@ -342,9 +383,15 @@ def build_graph(vector_store, llm, bm25, chunks):
             f"retry_query={review.retry_query!r}"
         )
 
+        event.update({
+            "sufficient": review.sufficient,
+            "retry_query": review.retry_query,
+        })
+
         return {
             "sufficient": review.sufficient,
             "retry_query": review.retry_query,
+            "assessment_events": previous_events + [event],
         }
 
     def grounded_generate_node(state: AgenticRAGState):
@@ -415,7 +462,8 @@ def build_graph(vector_store, llm, bm25, chunks):
         print("[citation check]", report)
 
         return {
-            "answer": answer
+            "answer": answer,
+            "exit_reason": "grounded_generate",
             }
 
     def apply_retry_query_node(state: AgenticRAGState):
@@ -429,7 +477,8 @@ def build_graph(vector_store, llm, bm25, chunks):
     def no_evidence_node(state: AgenticRAGState):
         """在重试次数耗尽或没有有效新查询时，给出明确的本地资料范围拒答。"""
         return {
-            "answer": "我没有在本地资料中找到足够证据来回答这个问题。"
+            "answer": "我没有在本地资料中找到足够证据来回答这个问题。",
+            "exit_reason": "no_evidence",
         }
 
     builder = StateGraph(AgenticRAGState)
