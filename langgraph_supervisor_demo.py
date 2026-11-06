@@ -234,30 +234,30 @@ def evaluate_case(supervisor, case: dict) -> dict:
             ),
         }
 
-    if case["name"] == "只问知识":
-        execution_checks.update({
-            "最后一轮证据充分": (
-                bool(events)
-                and events[-1].get("sufficient") is True
-            ),
-            "经过有证据生成节点": (
-                trace.get("exit_reason") == "grounded_generate"
-            ),
-        })
+        if case["name"] == "只问知识":
+            execution_checks.update({
+                "最后一轮证据充分": (
+                    bool(events)
+                    and events[-1].get("sufficient") is True
+                ),
+                "经过有证据生成节点": (
+                    trace.get("exit_reason") == "grounded_generate"
+                ),
+            })
 
-    else:
-        execution_checks.update({
-            "没有判定证据充分": (
-                bool(events)
-                and all(
-                    event.get("sufficient") is False
-                    for event in events
-                )
-            ),
-            "经过无证据退出节点": (
-                trace.get("exit_reason") == "no_evidence"
-            ),
-        })
+        else:
+            execution_checks.update({
+                "没有判定证据充分": (
+                    bool(events)
+                    and all(
+                        event.get("sufficient") is False
+                        for event in events
+                    )
+                ),
+                "经过无证据退出节点": (
+                    trace.get("exit_reason") == "no_evidence"
+                ),
+            })
 
     execution_check = {
         "applicable": case["name"] in {
