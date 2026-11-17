@@ -3,7 +3,7 @@
     Token 用量观察：模型响应与 Callback 统计对照
 
 实验目标：
-    理解一次模型调用的 Token 用量，以及 Callback 如何收集用量。
+    理解单次响应用量、同一 Callback 的累计行为，以及不同回调实例的统计隔离。
 
 解决的问题：
     只看模型回答，无法知道本次调用使用了多少输入和输出 Token。
@@ -20,23 +20,34 @@
 实现方式：
     使用 UsageMetadataCallbackHandler。
     在 invoke 的 config 中注册回调。
-    对照响应自带的用量和回调按模型累计的用量。
+    顺序执行两次独立 invoke，循环外创建同一个回调，按模型名累计。
+    将两次响应的三个核心用量字段求和，与回调累计值逐项比较。
+    随后新建空回调，检查实例独立且原回调累计值不变；这一步不增加模型调用。
 
 验证方式：
-    真实调用一次模型。
-    检查 input_tokens、output_tokens、total_tokens 是否一致。
-    用量缺失时明确输出原因，不把缺失记为零。
+    维护者已提供真实输出：单次响应用量与回调一致；两次累计及实例独立性均 PASS。
+    最新两次调用分别为 input/output/total=12/138/150 与 12/140/152，
+    累计为 24/278/302；新实例为 {}，原实例累计值保持不变。
+    此结果来自维护者日志，本次文档同步没有重新调用模型。
+    缺少用量、模型名或核心字段时输出未完成验收；这些缺失分支尚无实测记录。
 
 学习总结：
-    待真实运行后填写。
+    response.usage_metadata 只表示本次响应，回调按模型名累计观察到的用量。
+    复用实例会累计，新建实例从空统计开始；回调累计不代表对话历史累计。
+    PASS 证明本实验三个核心字段的收集和加法一致，不证明回答质量或账单准确。
 
 已知限制：
     依赖模型供应商返回用量。
-    当前只验证一次非流式聊天调用，不统计费用、失败请求或 Embedding。
+    当前仅验证同一模型、两次非流式聊天调用，不统计费用、失败请求或 Embedding。
+    最新日志 reasoning 分别为 155、142，均大于对应 output_tokens 138、140；
+    原因未确定，明细只作观察，不额外加到 output_tokens 或 total_tokens。
+    当前断言不验证明细字段、供应商计量准确性或模型回答质量。
+    重新运行整个脚本仍会发起两次真实模型调用；没有自动重试和调用预算验收。
     本地版本的回调需要同时取得 usage_metadata 和 model_name 才会累计。
 
 后续优化方向：
-    验证复用回调时的累计行为，再接入 Supervisor 的嵌套调用链。
+    独立实验作为基线保留；后续嵌套统计已在 Supervisor 验证正常与已处理业务异常。
+    Supervisor 已完成四条路径的嵌套记录与 JSON 对账；混合并行和失败调用待补。
 """
 
 import json
@@ -69,7 +80,7 @@ def main() -> None:
         base_url=os.getenv("LLM_BASE_URL"),
     )
 
-    # 两次调用共用这个实例，因此用量会累计到同一个回调中。
+    # 回调放在循环外供两次调用复用；放进循环会得到两个独立统计器。
     usage_callback = UsageMetadataCallbackHandler()
 
     questions = [
@@ -79,6 +90,7 @@ def main() -> None:
 
     responses = []
 
+    # 每次只发送当前问题，没有传入上一轮历史；这里只累计用量，不累计会话。
     for index, question in enumerate(questions, start=1):
         response = llm.invoke(
             [
@@ -176,7 +188,7 @@ def main() -> None:
         for field in TOKEN_FIELDS
     }
 
-    # 从回调中取出相同的三个核心字段。
+    # 只验收三个核心字段，不把 reasoning 等明细再次加进总量。
     actual_usage = {
         field: callback_usage[field]
         for field in TOKEN_FIELDS
@@ -197,7 +209,7 @@ def main() -> None:
         "PASS" if all(checks.values()) else "FAIL",
     )
 
-        # 保存原回调的三个累计值，便于核对它没有被新实例影响。
+    # 保存原回调的三个累计值，便于核对它没有被新实例影响。
     original_totals = {
         field: usage_callback.usage_metadata[model_name][field]
         for field in TOKEN_FIELDS

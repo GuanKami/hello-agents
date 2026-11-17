@@ -6,7 +6,7 @@
 
 > 当前状态：学习阶段，尚未进入最终项目的正式实现阶段。
 >
-> 截至 2026 年 10 月 28 日，已进入 Evaluation / Observability。JSON 报告、数学除零链与知识专家局部 trace 已分批验证，最新知识两例 2/2。新增检索上限断言待复跑；完整 Trace、引用语义、Token/成本仍待完善。
+> 截至 2026 年 11 月 17 日，专家局部 trace、独立 Token 实验与嵌套逐次用量记录已接入。知识生成、库外退出、正常计算及除零四条路径分批通过业务与 Token 对账；混合并行、模型失败事件、完整 Trace、引用语义及费用仍待完善。
 >
 > 2026 年 9 月 26 日两次北京实时天气查询均完成工具发现、调用、结果回传和模型回答；这不代表重复工具循环、其他城市或异常路径已经验证。维护者最新提供的 Hybrid RAG 输出读取 2 份 Markdown 并切分为 9 个文本块。针对 ToolMessage 问题，RRF Top-3 为 `react.md/start=363`（Dense/BM25 均第 1，0.0328）、`react.md/start=0`（均第 2，0.0323）、`stategraph.md/start=605`（Dense 第 3、BM25 未命中，0.0159）；图实际发送给 LLM 的上下文顺序与融合排名一致，答案使用了对应的 `[D1]`、`[D2]`、`[D3]`。这是一条小型语料上的正向端到端验证，不代表系统化检索质量、引用语义或库外拒答评估。此前输出里的 `It's always sunny ...` 来自固定天气示例，不作为真实天气接口的验证记录。
 
@@ -277,7 +277,7 @@ create_agent 在内部组织模型调用、工具执行和回到模型的循环�
 recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，当前已由注册的中间件
 转换为错误 ToolMessage，并通过内部执行验收；其他专家异常尚未统一处理。
 
-评估器支持知识、计算、混合、寒暄、库外和除零六类用例；当前 EVALUATION_CASES 启用知识两例。main 按该列表运行，共用初始化索引和 Supervisor。
+评估器支持知识、计算、混合、寒暄、库外和除零六类用例；当前 EVALUATION_CASES 仅启用除零单例。main 按该列表运行，共用初始化索引和 Supervisor。
 各用例只传入新消息，没有 checkpoint 会话延续。启动均会建立内存向量索引，
 因此纯计算或寒暄也有 Embedding 初始化请求，运行还会产生多次 Chat 请求。
 
@@ -287,9 +287,9 @@ recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，�
 
 ### 本地评估与报告
 
-2026-10-28：数学与知识专家均返回局部 artifact trace。知识有答案/库外两例在 supervisor_20261028_104622_109646.json 中 2/2：分别检索 1 次后生成，以及检索 2 次、末轮解析失败后保守退出。新增检索上限断言已在代码中，但该报告未包含此断言，尚待复跑。历史正常 3/3、边界 2/2、除零 1/1 为分批结果，尚无当前版本同批六例回归证据。 当前 EVALUATION_CASES 启用知识两例；后续先修正验收分支缩进，再做 Token 用量统计。
+历史记录（2026-10-28）：知识两例 2/2，库外末轮解析失败后保守退出。当时的缩进问题和上限断言待复跑事项已由 2026-11-17 的当前代码及四条分批报告更新，详见下方嵌套 Token 验收。
 
-运行后保存 evaluation_reports/supervisor_<时间戳>.json，包含 schema_version、运行时间及本机时区偏移、配置模型名、汇总、逐条流程和业务检查、专家调用次数、答案、耗时，以及 expert_traces / execution_check。文件使用 UTF-8 和独立时间戳，以 x 模式避免覆盖。计时不包含启动索引和报告保存；当前有两类专家局部 trace，尚无 Token/成本或完整 Trace。
+运行后保存 evaluation_reports/supervisor_<时间戳>.json，含逐例业务/内部检查、expert_traces、token_usage_by_model、model_calls 和 token_usage_check。用量对账与业务 passed 分开保存。时间戳文件以 x 模式避免覆盖，计时不含启动索引和保存；完整来源映射、模型失败事件及费用尚未覆盖。
 
 | 报告 | 已观察结果 |
 | --- | --- |
@@ -307,17 +307,47 @@ recursion_limit=20 是父图步数约束。数学工具零除抛 ValueError，�
 
 **数学异常链已验收**：数学专家已注册 handle_math_tool_error，捕获 divide 的已知除零 ValueError。内部错误 ToolMessage 的 artifact 保存错误码和异常类型；ask_math_agent 按 tool_call_id 关联参数与返回消息，汇总耗时及工具事件，经专家工具的 artifact 返回父层。evaluate_case 提取记录，附上 parent_tool_call_id 并保存到 JSON。只有“不能除以零”的回答而没有实际调用工具，仍不能通过内部执行检查。
 
-父层 ask_math_agent 正常返回表示专家完成了失败说明，不代表内部 divide 计算成功。局部 trace 仅在专家 invoke 正常返回后构建，尚未保存未处理异常前的完整过程。知识专家过程记录已接入；下一步先修正验收分支缩进并回归，再学习 Token 用量统计。来源映射、未处理异常和预算后续补充。
+父层 ask_math_agent 正常返回表示专家完成失败说明，不代表 divide 计算成功。局部 trace 仅在专家正常返回后构建。旧知识检查缩进已修正，检索上限断言与正常计算/除零已复跑通过；未处理异常过程、来源映射及预算仍待补。
 
 报告包含最终回答、工具参数和执行记录等业务内容，目前 evaluation_reports/ 仍未被 Git 忽略；提交前应检查其中内容。成功复跑没有消除之前观察到的限流、解析异常和引用质量限制。
 
 知识过程验收（2026-10-28）：supervisor_20261028_104622_109646.json 保存 retrieval_count、assessment_events、exit_reason 和 parent_tool_call_id。第二例的末轮 sufficient=False 来自解析失败后的程序回退，不是正常解析结论。当前新增上限断言已静态核对，报告仍是添加前版本。当前知识检查 if/else 位于知识分支外，其他用例可能访问未定义 events；需修正后回归。首轮解析失败仍抛出，异常前的完整 trace 未收集。
 
+### 独立 Token 用量实验
+
+`langgraph_token_usage_demo.py` 使用 UsageMetadataCallbackHandler，顺序调用同一模型两次，比较响应核心用量之和与回调累计值，再验证新回调为空且原统计不变。每次只传当前问题，用量累计不代表对话历史累计。
+
+维护者已提供三项验收通过的输出。最新两次 input/output/total 为 12/138/150 和 12/140/152，累计为 24/278/302；新实例为 {}，原实例保持累计值。这些是观察值，不是下次运行的固定预期。
+
+```powershell
+.\.venv\Scripts\python.exe langgraph_token_usage_demo.py
+```
+
+整个脚本发起两次真实模型调用，新建空回调本身不增加请求。缺少用量、模型名或核心字段时输出未完成验收，缺失分支尚未实测。最新 reasoning 明细为 155/142，大于对应 output_tokens 138/140，原因未确定；累计 PASS 只证明核心字段收集一致，不证明供应商计量准确或回答质量。不要把 reasoning 再次加进总量。
+
+独立 Demo 保持基线；Supervisor 已接入逐例回调、逐次记录和对账，四条路径分批通过，见下节。模型失败、Embedding、费用和混合并行 Token 尚未验收。
+
+### Supervisor 嵌套 Token 验收
+
+2026-11-17：嵌套 Token 基础统计按四条成功报告收口。知识有答案/无答案分别 5 次完成调用，正常计算/除零分别 4 次；四例均为单独 1/1，业务、适用的内部检查及 Token 对账通过。当前仅启用除零单例；未做同批六例回归，混合并行及模型请求失败的用量覆盖未验收。
+
+每条用例在父层注册独立累计回调和 ModelCallRecorder，JSON 保存 token_usage_by_model、model_calls、token_usage_check。记录含 run_id、parent_run_id、node、tags、model 和三个核心用量字段。Token 对账独立于业务 passed；只记录完成响应，不统计模型失败事件、HTTP 重试、Embedding 或费用。node=model 尚不能精确区分父层与数学专家；对账一致不自动证明覆盖完整。
+
+| 路径 | 完成调用数 | 输入 / 输出 / 总 Token |
+| --- | ---: | --- |
+| 知识有答案 | 5 | 2143 / 1640 / 3783 |
+| 知识库无答案 | 5 | 1936 / 744 / 2680 |
+| 正常计算 | 4 | 895 / 176 / 1071 |
+| 除零异常 | 4 | 920 / 258 / 1178 |
+
+对应报告分别为 supervisor_20261117_110350_611161.json、supervisor_20261117_110628_103482.json、supervisor_20261117_111830_710609.json、supervisor_20261117_112243_171579.json。数字是本次观察值，不是固定调用次数或用量预算。库外末轮解析失败仍计入已完成模型响应；除零错误码 DIVISION_BY_ZERO 与内部参数检查通过。reasoning 明细口径异常仍保留，不额外加到总量。
+
 ### 实验目录
 
 | 文件 | 学习内容 | 当前状态 |
 | --- | --- | --- |
-| `langgraph_supervisor_demo.py` | 专家委派与批量验收 | 数学/知识局部 trace 已分批验证，知识两例 2/2；新增上限断言待复跑，其他用例有检查分支缩进限制 |
+| `langgraph_supervisor_demo.py` | 专家委派、过程记录与 Token 对账 | 四条路径各 1/1，完成调用数 5/5/4/4；混合并行及模型失败覆盖待验收 |
+| `langgraph_token_usage_demo.py` | 单次用量、累计及实例隔离 | 独立基线已通过；后续 Supervisor 嵌套验收见上节 |
 | [`langgraph_map_reduce_demo.py`](langgraph_map_reduce_demo.py) | Send 动态分发、局部任务输入、列表 reducer 与按主题汇总 | 三主题正常路径已手动验证；更多规模和异常路径未验证 |
 | [`langgraph_parallel_demo.py`](langgraph_parallel_demo.py) | 固定分叉、等待汇合、operator.add 合并共享 results | 已由维护者手动验证；保留固定分支基线，异常路径未验证 |
 | [`langgraph_rag_demo.py`](langgraph_rag_demo.py) | 固定两步 Hybrid RAG：Dense + BM25 + RRF、State 传递和带引用生成 | 已完成一次端到端正向运行，图内 RRF 名次与模型上下文/D# 顺序一致；更广评测与库外拒答待后续补充 |
@@ -373,6 +403,7 @@ hello-agents/
 ├── langgraph_parallel_demo.py                  # 固定并行与 results 列表 reducer
 ├── langgraph_map_reduce_demo.py                # Send 动态分发与 Map-Reduce
 ├── langgraph_supervisor_demo.py                # Supervisor 委派知识与数学专家
+├── langgraph_token_usage_demo.py               # 独立 Token 用量对照、累计与实例隔离
 ├── rag_docs/
 │   ├── react.md                                  # RAG 知识库样例
 │   └── stategraph.md                             # RAG 知识库样例
@@ -467,7 +498,7 @@ python -m venv .venv
 语法检查可以使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_subgraph_demo.py langgraph_parallel_demo.py langgraph_map_reduce_demo.py langgraph_supervisor_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
+.\.venv\Scripts\python.exe -m py_compile langgraph_token_usage_demo.py tools.py langgraph_react.py langgraph_state_react.py embedding_test.py langgraph_rag_demo.py langgraph_bm25_demo.py langgraph_hybrid_rag_demo.py langgraph_agentic_rag_demo.py langgraph_subgraph_demo.py langgraph_parallel_demo.py langgraph_map_reduce_demo.py langgraph_supervisor_demo.py langgraph_context_demo.py langgraph_state_context_demo.py langgraph_middleware_dynamic_prompt_demo.py langgraph_middleware_hooks_demo.py langgraph_middleware_wrap_model_call_demo.py langgraph_middleware_wrap_tool_call_demo.py langgraph_middleware_tool_guard_demo.py langgraph_middleware_tool_error_demo.py langgraph_human_in_the_loop_demo.py langgraph_human_in_the_loop_sqlite_demo.py langgraph_mcp_demo.py mcp_server/get_weather_mcp/server.py
 ```
 
 MCP 命令会启动本地 stdio Server，并请求真实天气 API 和 LLM；可能产生外部请求或费用。运行前需要在根目录 `.env` 配置 `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`、`QWEATHER_API_HOST` 和 `QWEATHER_API_KEY`。模型、Embedding、搜索和天气工具都可能访问外部 API；不要把 `.env` 提交到 Git，也不要在日志中打印密钥。
@@ -531,7 +562,7 @@ Middleware
   -> Send / Map-Reduce [三主题正常路径已手动验证，2026-10-16]
   -> 并行子图 [可选补充，尚未学习]
   -> Supervisor / Multi-Agent [三条基础路径已手动验证，2026-10-16]
-  -> Evaluation / Observability [JSON、数学局部 trace 与除零链已验证；知识过程已验证；完整 Trace/Token 待补]
+  -> Evaluation / Observability [JSON、数学局部 trace 与除零链已验证；知识过程及独立 Token 实验已验证；嵌套 Token 四条路径分批通过；混合并行/模型失败/完整 Trace 待补]
   -> RepoResearcher MVP
   -> DeerFlow 源码对照与工程化演进
 ```

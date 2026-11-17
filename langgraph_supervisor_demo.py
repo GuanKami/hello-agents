@@ -36,6 +36,9 @@ Supervisor 整理最终回答
     run_evaluation 逐条打印检查并返回报告；save_evaluation_report 保存 JSON。
     数学专家已注册 handle_math_tool_error，错误消息的 artifact 保存错误码。
     ask_math_agent 汇总耗时和工具事件，经外层 artifact 返回父层评估器。
+    每条用例创建独立的累计回调与 ModelCallRecorder，在父层请求统一注册。
+    记录已完成模型运行的 ID、父运行 ID、节点、模型及核心用量，再按模型对账。
+    Token 检查单独保存，当前不参与业务 passed 的计算。
 验证方式：
     2026-10-16，维护者提供三条真实运行：知识问题仅调用知识专家；除法仅调用
     数学专家并执行 divide；混合问题调用两个专家后汇总，观察到专家执行重叠。
@@ -47,7 +50,11 @@ Supervisor 整理最终回答
     三项内部执行检查通过；专家耗时 5.17 秒、整例 8.39 秒。
     2026-10-28，supervisor_20261028_104622_109646.json 知识两例 2/2：
     有答案检索一次后生成；库外问题第二轮解析失败，在上限处保守回退退出。
-    当前启用知识两例；新增检索上限断言已写入代码，尚无含此断言的新报告。
+    2026-11-17 四条用例分别 1/1，业务与 Token 对账均通过：
+    知识生成 5 次、input/output/total=2143/1640/3783；
+    库外退出 5 次、1936/744/2680，末轮解析失败的响应仍计入用量；
+    正常计算 4 次、895/176/1071；除零 4 次、920/258/1178。
+    知识两例的检索上限断言已随报告通过；当前仅启用除零单例。
     历史各批分别通过，不代表当前版本同批六例回归通过。
     历史报告保留限流及评估解析异常；成功复跑不证明异常已修复。
     曾出现 Supervisor 汇总丢失引用；强化保留引用的提示词后，本次复跑通过。
@@ -68,13 +75,17 @@ Supervisor 整理最终回答
     文本检查依赖短语，除零与知识两例另有独立的内部执行检查。
     invoke 异常已记录且跳过正常打印；未知用例会抛 ValueError，不再空检查通过。
     消息处理、业务检查与写文件错误不在 invoke 的 try 范围内，仍可能中断整批。
-    报告含数学与知识专家局部 trace，不含完整内部消息、来源映射或 Token/成本。
-    当前知识检查的 if/else 位于知识分支外，其他用例可能访问未定义的 events；
-    两条知识用例通过不能证明其他用例在当前版本仍可执行。
+    报告含两类专家局部 trace、逐次模型记录和按模型累计用量，不含完整来源映射或费用。
+    记录器只观察完成事件，不覆盖 on_llm_error、SDK 内部 HTTP 重试或 Embedding。
+    同一 node=model 可属于父层或数学专家，当前没有精确角色标签和完整运行树。
+    去重及求和通过不自动证明所有子调用均被观察；需结合具体路径核对覆盖。
+    混合并行任务、缺失用量和模型请求失败路径尚未验收。
+    reasoning 明细曾大于 output_tokens，原因未确定，不重复加进总量。
     父层专家工具正常返回与内部 divide 业务失败可以同时成立。
 后续优化方向：
-    先修正知识验收分支的缩进并回归其他用例，再学习 Token 用量统计；
-    来源映射、未处理异常与预算后续补充，保留成功及失败报告。
+    正常与已处理业务异常路径的嵌套 Token 统计按四条分批报告收口。
+    后续验证混合任务/并行、补充角色归属和失败调用记录，再考虑费用与预算；
+    来源映射和引用语义仍待完善，保留成功及失败报告。
 """
 import os
 import re
@@ -84,6 +95,8 @@ from pathlib import Path
 from time import perf_counter
 from dotenv import load_dotenv
 from collections.abc import Callable
+from copy import deepcopy
+from threading import Lock
 
 from langchain.agents.middleware import wrap_tool_call
 from langchain.tools.tool_node import ToolCallRequest
@@ -93,6 +106,9 @@ from langchain.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.messages import AIMessage, ToolMessage
+from langchain_core.callbacks import UsageMetadataCallbackHandler
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.outputs import ChatGeneration, LLMResult
 
 from langgraph_agentic_rag_demo import (
     build_graph as build_rag_graph,
@@ -106,25 +122,205 @@ from langgraph_hybrid_rag_demo import (
 
 from tools import divide
 
-# 评估规则覆盖六类任务；当前仅启用知识有答案和知识库无答案两例。
-# 除零与知识两例有内部执行检查；检索上限断言是报告生成后补入的。
+TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+)
+
+class ModelCallRecorder(BaseCallbackHandler):
+    """记录已完成的聊天模型调用；完成顺序不等于并行调用的开始顺序。
+
+    保留重复事件供检查，不静默去重。run_id 属于回调运行树，
+    parent_run_id 不是专家工具的 parent_tool_call_id；缺失用量保留 None。
+    当前只取单条输入的首个候选结果，不处理失败事件、HTTP 重试或 Embedding。
+    """
+    def __init__(self) -> None:
+        super().__init__()
+        # 保护这些共享数据的读写
+        self._lock = Lock()
+        # 暂存每次调用开始时的信息
+        self._starts: dict[str, dict] = {}
+        # 保存正常结束后的调用记录
+        self._calls: list[dict] = []
+
+    def on_chat_model_start(
+        self,
+        serialized,
+        messages,
+        *,
+        run_id,
+        parent_run_id=None,
+        metadata=None,
+        tags=None,
+        **kwargs,
+    ) -> None:
+        metadata = metadata or {}
+
+        start_info = {
+            "node": metadata.get("langgraph_node"),
+            "tags": list(tags or []),
+        }
+
+        with self._lock:
+            self._starts[str(run_id)] = start_info
+
+    def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id,
+        parent_run_id=None,
+        **kwargs,
+    ) -> None:
+        # 本实验使用单条输入、单个候选结果的聊天模型调用。
+        generation = (
+            response.generations[0][0]
+            if response.generations and response.generations[0]
+            else None
+        )
+
+        message = (
+            generation.message
+            if isinstance(generation, ChatGeneration)
+            else None
+        )
+
+        usage = getattr(message, "usage_metadata", None)
+        response_metadata = (
+            getattr(message, "response_metadata", None) or {}
+        )
+
+        with self._lock:
+            start_info = self._starts.get(str(run_id), {})
+
+            self._calls.append({
+                "run_id": str(run_id),
+                "parent_run_id": (
+                    str(parent_run_id)
+                    if parent_run_id is not None
+                    else None
+                ),
+                "node": start_info.get("node"),
+                "tags": start_info.get("tags", []),
+                # 与当前内置累计回调采用相同的模型名字段。
+                "model": response_metadata.get("model_name"),
+                # 缺失保留为 None，不默认成 0。
+                "input_tokens": (
+                    usage.get("input_tokens")
+                    if usage is not None
+                    else None
+                ),
+                "output_tokens": (
+                    usage.get("output_tokens")
+                    if usage is not None
+                    else None
+                ),
+                "total_tokens": (
+                    usage.get("total_tokens")
+                    if usage is not None
+                    else None
+                ),
+            })
+
+    def snapshot(self) -> list[dict]:
+        """返回独立快照，供评估和 JSON 保存使用。"""
+        with self._lock:
+            return deepcopy(self._calls)
+
+# 评估规则覆盖六类任务；当前只启用除零单例，四条路径已分批验收。
+# 除零与知识两例有内部执行检查；知识检索上限断言已在 2026-11-17 报告通过。
 # 专家集合只检查选择范围，不约束调用顺序或重复调用次数。
 EVALUATION_CASES = [
     {
-        "name": "只问知识",
-        "question": "请解释 StateGraph 中 Node 的职责。",
-        "expected_tools": {"ask_knowledge_agent"},
+        "name": "除零异常",
+        "question": "请计算 10 除以 0。",
+        "expected_tools": {"ask_math_agent"},
     },
-    {
-        "name": "知识库无答案",
-        "question": "DeerFlow 使用什么数据库保存长期记忆？",
-        "expected_tools": {"ask_knowledge_agent"},
-    },
+
 ]
+
+def check_token_usage(
+    model_calls: list[dict],
+    usage_by_model: dict,
+) -> dict:
+    """核对运行 ID 唯一性、字段完整性和核心用量之和，不验证账单准确性。
+
+    两个回调可能同时漏记同一子调用；通过对账仍需结合节点路径核对覆盖。
+    不把 reasoning 等明细重复计入 total_tokens；结果与业务 passed 分别保存。
+    """
+
+    run_ids = [
+        event["run_id"]
+        for event in model_calls
+    ]
+
+    calls_missing_usage = sum(
+        any(event[field] is None for field in TOKEN_FIELDS)
+        for event in model_calls
+    )
+
+    calls_missing_model = sum(
+        not event["model"]
+        for event in model_calls
+    )
+
+    # 只对模型名和核心用量完整的事件求和。
+    summed_by_model = {}
+
+    for event in model_calls:
+        model = event["model"]
+
+        if not model or any(
+            event[field] is None
+            for field in TOKEN_FIELDS
+        ):
+            continue
+
+        totals = summed_by_model.setdefault(
+            model,
+            {field: 0 for field in TOKEN_FIELDS},
+        )
+
+        for field in TOKEN_FIELDS:
+            totals[field] += event[field]
+
+    callback_totals = {
+        model: {
+            field: usage.get(field)
+            for field in TOKEN_FIELDS
+        }
+        for model, usage in usage_by_model.items()
+    }
+
+    checks = {
+        "存在模型完成记录": bool(model_calls),
+        "模型运行ID没有重复": (
+            len(run_ids) == len(set(run_ids))
+        ),
+        "每次记录都有核心用量": calls_missing_usage == 0,
+        "每次记录都有模型名": calls_missing_model == 0,
+        "逐次求和与累计回调一致": (
+            summed_by_model == callback_totals
+        ),
+    }
+
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+        "completed_model_calls": len(model_calls),
+        "calls_missing_usage": calls_missing_usage,
+        "calls_missing_model": calls_missing_model,
+        "summed_by_model": summed_by_model,
+    }
 
 def evaluate_case(supervisor, case: dict) -> dict:
     """运行真实模型并生成验收报告；计时不含模型与向量索引初始化。"""
     started = perf_counter()
+
+    # 每条用例单独统计，避免不同用例互相累计。
+    usage_callback = UsageMetadataCallbackHandler()
+    call_recorder = ModelCallRecorder()
 
     try:
         result = supervisor.invoke(
@@ -133,7 +329,10 @@ def evaluate_case(supervisor, case: dict) -> dict:
                     {"role": "user", "content": case["question"]},
                 ],
             },
-            config={"recursion_limit": 20},
+            config={
+                "recursion_limit": 20,
+                "callbacks": [usage_callback, call_recorder],
+            },
         )
     except Exception as exc:
         # 验收层记录失败，继续执行下一条用例。
@@ -143,7 +342,23 @@ def evaluate_case(supervisor, case: dict) -> dict:
             "passed": False,
             "elapsed_s": round(perf_counter() - started, 2),
             "error_type": type(exc).__name__,
+            "token_usage_by_model": token_usage_by_model,
+            "model_calls": model_calls,
+            "token_usage_check": check_token_usage(
+                model_calls,
+                token_usage_by_model,
+            ),
         }
+
+    model_calls = call_recorder.snapshot()
+    token_usage_by_model = deepcopy(
+        usage_callback.usage_metadata
+    )
+
+    token_usage_check = check_token_usage(
+        model_calls,
+        token_usage_by_model,
+    )
 
     messages = result["messages"]
 
@@ -326,6 +541,9 @@ def evaluate_case(supervisor, case: dict) -> dict:
         "error_type": None,
         "expert_traces": expert_traces,
         "execution_check": execution_check,
+        "token_usage_by_model": usage_callback.usage_metadata,
+        "model_calls": model_calls,
+        "token_usage_check": token_usage_check,
     }
 
 def run_evaluation(supervisor) -> list[dict]:
@@ -340,6 +558,38 @@ def run_evaluation(supervisor) -> list[dict]:
 
         # 异常报告没有 business_check 等正常结果字段。
         # 打印异常后跳过本轮，继续运行下一条用例。
+
+        print("按模型累计的 Token 用量：")
+        print(json.dumps(
+            report["token_usage_by_model"],
+            ensure_ascii=False,
+            indent=2,
+        ))
+
+        print("\n=== 逐次模型调用记录 ===")
+
+        for index, event in enumerate(
+            report["model_calls"],
+            start=1,
+        ):
+            print(
+                f"[model call {index}] "
+                f"node={event['node']}, "
+                f"model={event['model']}, "
+                f"input={event['input_tokens']}, "
+                f"output={event['output_tokens']}, "
+                f"total={event['total_tokens']}, "
+                f"run_id={event['run_id']}, "
+                f"parent_run_id={event['parent_run_id']}"
+            )
+
+        print("\n=== Token 对账结果 ===")
+        print(json.dumps(
+            report["token_usage_check"],
+            ensure_ascii=False,
+            indent=2,
+        ))
+
         if report["error_type"]:
             print("结果：FAIL")
             print("异常类型：", report["error_type"])
@@ -387,7 +637,10 @@ def check_business_answer(case: dict, answer: str) -> dict:
 
     if case["name"] == "只问知识":
         checks = {
-            "包含 Node": "Node" in answer,
+            "包含 Node 或节点": (
+                "node" in answer.casefold()
+                or "节点" in answer
+            ),
             "包含 State 或状态": "State" in answer or "状态" in answer,
             "包含字段更新": (
                 "字段更新" in answer
@@ -404,7 +657,10 @@ def check_business_answer(case: dict, answer: str) -> dict:
 
     elif case["name"] == "知识与计算":
         checks = {
-            "包含 Node": "Node" in answer,
+            "包含 Node 或节点": (
+                "node" in answer.casefold()
+                or "节点" in answer
+            ),
             "包含计算结果": "224.6" in answer,
             "包含标准引用标记": has_citation,
         }
@@ -514,7 +770,8 @@ def save_evaluation_report(
         "cases": reports,
     }
 
-    # 报告含两类专家局部 trace，不含完整内部消息、问题、来源映射或 Token/成本。
+    # 报告含两类专家局部 trace、model_calls、累计 Token 和独立对账结果。
+    # 不含完整内部消息、问题、来源映射或费用；没有模型失败事件与 HTTP 重试计数。
     # invoke 异常仅记录类型和耗时，尚无异常前的完整执行记录。
     # x 模式避免意外覆盖已经存在的报告。
     with report_path.open("x", encoding="utf-8") as file:
